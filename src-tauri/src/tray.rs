@@ -148,8 +148,13 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(handle_menu_event)
         .on_tray_icon_event(|tray, event| {
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
-            if let tauri::tray::TrayIconEvent::Click { button, .. } = event {
-                if button == tauri::tray::MouseButton::Left {
+            if let tauri::tray::TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                if is_toggle_click(button, button_state) {
                     toggle_popover(tray.app_handle());
                 }
             }
@@ -215,6 +220,21 @@ pub fn apply(app: &AppHandle, snapshot: &UsageSnapshot) {
     if let Ok(menu) = build_menu(app, &menu_labels(&snapshot.quotas, now)) {
         let _ = tray.set_menu(Some(menu));
     }
+}
+
+/// Whether a tray click event should toggle the popover.
+///
+/// `TrayIconEvent::Click` fires once for the press (`button_state: Down`) and
+/// once for the release (`Up`) — matching on the button alone toggles twice
+/// per click (open on press, closed on release), so the panel only stayed
+/// visible while the mouse button was held down. Acting on `Up` only also
+/// matches platform convention: pressing the icon and dragging away cancels
+/// instead of opening the panel.
+fn is_toggle_click(
+    button: tauri::tray::MouseButton,
+    button_state: tauri::tray::MouseButtonState,
+) -> bool {
+    button == tauri::tray::MouseButton::Left && button_state == tauri::tray::MouseButtonState::Up
 }
 
 fn toggle_popover(app: &AppHandle) {
@@ -463,5 +483,17 @@ mod tests {
     #[test]
     fn no_quotas_means_the_neutral_icon() {
         assert_eq!(IconKind::for_quotas(&[]), IconKind::Neutral);
+    }
+
+    #[test]
+    fn only_a_left_click_release_toggles_the_popover() {
+        use tauri::tray::{MouseButton, MouseButtonState};
+
+        assert!(is_toggle_click(MouseButton::Left, MouseButtonState::Up));
+        // The press, not just the release, used to also match — toggling the
+        // panel open and shut again before the button was let go.
+        assert!(!is_toggle_click(MouseButton::Left, MouseButtonState::Down));
+        assert!(!is_toggle_click(MouseButton::Right, MouseButtonState::Up));
+        assert!(!is_toggle_click(MouseButton::Middle, MouseButtonState::Up));
     }
 }
