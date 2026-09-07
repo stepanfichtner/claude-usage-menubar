@@ -55,20 +55,101 @@ fn primed_level(percent: f64) -> u8 {
     percent.floor().clamp(0.0, 100.0) as u8
 }
 
-fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
+/// What a poll does to the anchor stored for a quota.
+///
+/// Deliberately not an `Option<DateTime<Utc>>`: `None` there would have to
+/// mean both "this quota has no anchor" and "leave the stored anchor alone",
+/// and those are the two things a `(Some a, None)` poll has to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorUpdate {
+    /// Leave the stored anchor exactly as it is.
+    Keep,
+    /// Store this timestamp as the anchor for future comparisons.
+    Adopt(DateTime<Utc>),
+}
+
+/// The two independent answers one poll's `resets_at` gives about a quota's
+/// window. They used to be a single `same_window` bool, which forced them to
+/// agree: "not a new window" also meant "do not touch the anchor", and a
+/// quota whose reset time arrived late could then never anchor at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowVerdict {
+    /// Whether this poll starts a new window, which zeroes `highest_fired`
+    /// and lets every threshold under the current percentage announce again.
+    re_arms: bool,
+    /// What to do with the stored anchor, regardless of the answer above.
+    anchor: AnchorUpdate,
+}
+
+/// Reads one poll's `resets_at` against the anchor stored for that quota.
+///
+/// | stored → incoming            | re-arms | anchor      |
+/// |------------------------------|---------|-------------|
+/// | `(None, None)`               | no      | `Keep`      |
+/// | `(Some a, Some b)` within tol | no     | `Keep`      |
+/// | `(Some a, Some b)` beyond tol | **yes** | `Adopt(b)`  |
+/// | `(Some a, None)`             | no      | `Keep` (`a`) |
+/// | `(None, Some b)`             | no      | `Adopt(b)`  |
+///
+/// Only `Some → Some` past the tolerance re-arms. A `resets_at` that appears
+/// or disappears is far more likely a transient gap in an undocumented API's
+/// response than a window boundary — a real reset moves the timestamp forward
+/// by the whole window, five hours at the shortest, and shows up as
+/// `Some → Some` well past the tolerance.
+fn classify_window(
+    stored: Option<DateTime<Utc>>,
+    incoming: Option<DateTime<Utc>>,
+) -> WindowVerdict {
     match (stored, incoming) {
-        (None, None) => true,
-        (Some(a), Some(b)) => (a - b).num_seconds().abs() < SAME_WINDOW_TOLERANCE_SECS,
-        _ => false,
+        // Nothing on either side has ever said where this window ends, so
+        // nothing can say it moved.
+        (None, None) => WindowVerdict {
+            re_arms: false,
+            anchor: AnchorUpdate::Keep,
+        },
+        (Some(a), Some(b)) => {
+            if (a - b).num_seconds().abs() < SAME_WINDOW_TOLERANCE_SECS {
+                // The server's per-request wobble. Keeping the first-seen
+                // anchor rather than adopting `b` is what makes cumulative
+                // drift detectable at all; see
+                // `a_slow_drift_past_the_tolerance_is_eventually_caught`.
+                WindowVerdict {
+                    re_arms: false,
+                    anchor: AnchorUpdate::Keep,
+                }
+            } else {
+                WindowVerdict {
+                    re_arms: true,
+                    anchor: AnchorUpdate::Adopt(b),
+                }
+            }
+        }
+        // The field went missing. Keep `a`: the window it described is still
+        // the best information there is, and dropping it would leave the
+        // quota unanchored, so the poll where the timestamp comes back would
+        // read as `(None, Some)` instead of the same-window comparison it is.
+        (Some(_), None) => WindowVerdict {
+            re_arms: false,
+            anchor: AnchorUpdate::Keep,
+        },
+        // The field arrived. Not a boundary — the server merely started
+        // reporting one — but it must be recorded, or the quota stays
+        // unanchored and the genuine reset that follows goes undetected
+        // forever.
+        (None, Some(b)) => WindowVerdict {
+            re_arms: false,
+            anchor: AnchorUpdate::Adopt(b),
+        },
     }
 }
 
 /// Remembers, per quota, the highest threshold already announced for the
 /// current window. Dropping back below a threshold does not re-arm it — only a
 /// new window does (spec §10). The window's anchor is the `resets_at` first
-/// seen for it and is kept fixed for as long as `same_window` holds, since the
-/// server's value wobbles a little on every poll rather than staying fixed
-/// (spec §10.1).
+/// seen for it and is kept fixed while polls keep landing inside the
+/// tolerance, since the server's value wobbles a little on every poll rather
+/// than staying fixed (spec §10.1). Whether a poll re-arms and what it does
+/// to the anchor are two separate answers; `classify_window` gives both.
 ///
 /// Notifies on transitions this app has observed, not on state it inherited
 /// at startup (spec §10.2): the first `evaluate` call for a given quota id
@@ -116,8 +197,14 @@ impl Notifier {
                 }
                 Entry::Occupied(mut slot) => {
                     let entry = slot.get_mut();
-                    if !same_window(entry.window, quota.resets_at) {
-                        entry.window = quota.resets_at;
+                    // Two separate answers, applied separately. A poll can
+                    // update the anchor without re-arming — that is the whole
+                    // point of the split.
+                    let verdict = classify_window(entry.window, quota.resets_at);
+                    if let AnchorUpdate::Adopt(anchor) = verdict.anchor {
+                        entry.window = Some(anchor);
+                    }
+                    if verdict.re_arms {
                         entry.highest_fired = 0;
                     }
 
@@ -496,10 +583,10 @@ mod tests {
     /// (the shortest real window is five hours, so a genuine reset can never
     /// land this close to the previous one).
     ///
-    /// Note that the anchor stays at `t0` for all three calls: `evaluate`
-    /// rewrites `window` only when `same_window` is false, so the 300s call
-    /// is compared against the window's first-seen value and not against the
-    /// 299s one.
+    /// Note that the anchor stays at `t0` for all three calls: a `Some, Some`
+    /// pair inside the tolerance answers `AnchorUpdate::Keep`, so the 300s
+    /// call is compared against the window's first-seen value and not against
+    /// the 299s one.
     #[test]
     fn a_reset_time_exactly_the_tolerance_away_is_a_new_window() {
         let mut notifier = Notifier::new();
@@ -535,31 +622,83 @@ mod tests {
         );
     }
 
-    /// The asymmetric arm of `same_window`. A `resets_at` that appears or
-    /// disappears is neither `(None, None)` nor `(Some, Some)`, so it falls
-    /// to the `_` arm, which answers `false` — a window change. That resets
-    /// `highest_fired` to 0, and the same poll then re-announces the highest
-    /// threshold the quota is already standing on: a banner the user has
-    /// already seen, for a window that never reset. It is the loudest
-    /// failure available in this module, which is why it is pinned.
+    /// The window table itself, read off `classify_window` so that each of
+    /// its two answers is checked apart from the other. Every one of the five
+    /// `(stored, incoming)` shapes is asserted on both axes here: `(None,
+    /// None)`, `(Some, Some)` inside the tolerance, `(Some, Some)` beyond it,
+    /// `(Some, None)` and `(None, Some)`. The behavioural consequences are
+    /// pinned in the `evaluate` tests below; this pins the classification.
+    ///
+    /// The two `Adopt` rows are what the old single-bool shape could not
+    /// express. `(None, Some b)` has to adopt without re-arming, and
+    /// `(Some a, None)` has to keep without re-arming — one bool driving both
+    /// effects forces those two rows to the same answer, and either choice is
+    /// wrong for one of them.
+    #[test]
+    fn classify_window_answers_re_arming_and_anchoring_separately() {
+        let a = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+        let jittered = a + chrono::Duration::seconds(299);
+        let next_window = a + chrono::Duration::hours(5);
+
+        assert_eq!(
+            classify_window(None, None),
+            WindowVerdict {
+                re_arms: false,
+                anchor: AnchorUpdate::Keep
+            }
+        );
+        assert_eq!(
+            classify_window(Some(a), Some(jittered)),
+            WindowVerdict {
+                re_arms: false,
+                anchor: AnchorUpdate::Keep
+            },
+            "jitter inside the tolerance keeps the first-seen anchor"
+        );
+        assert_eq!(
+            classify_window(Some(a), Some(next_window)),
+            WindowVerdict {
+                re_arms: true,
+                anchor: AnchorUpdate::Adopt(next_window)
+            },
+            "a genuine reset is the only shape that re-arms"
+        );
+        assert_eq!(
+            classify_window(Some(a), None),
+            WindowVerdict {
+                re_arms: false,
+                anchor: AnchorUpdate::Keep
+            },
+            "a `resets_at` going missing must not re-arm, and must not \
+             discard the anchor it leaves behind"
+        );
+        assert_eq!(
+            classify_window(None, Some(a)),
+            WindowVerdict {
+                re_arms: false,
+                anchor: AnchorUpdate::Adopt(a)
+            },
+            "a `resets_at` arriving must not re-arm, but must be recorded — \
+             keeping `None` here leaves the quota unable to ever detect one"
+        );
+    }
+
+    /// A `resets_at` that goes missing and comes back is a gap in the
+    /// response, not a window boundary. A genuine reset arrives as
+    /// `Some → Some` with a delta of hours, which the tolerance already
+    /// catches; nothing else can move a real window.
     ///
     /// The shape is not hypothetical: `weekly_scoped` ships
     /// `"resets_at": null` in the live payload today
     /// (tests/fixtures/usage_full.json), so a quota that carries a timestamp
     /// on one poll and null on the next is something this server can
-    /// produce, and a field that flaps fires on every other poll — the third
-    /// call below.
-    ///
-    /// This pins today's answer rather than endorsing it. The alternative —
-    /// reading a missing `resets_at` as "no news, same window" — is a real
-    /// option and a quieter one; its cost is that a quota whose reset time
-    /// goes missing could then never re-arm, which is exactly the behaviour
-    /// `a_quota_with_no_reset_time_does_not_re_arm` already pins for the
-    /// `(None, None)` case. Whichever way that is decided, this test is
-    /// where the decision is written down: it fails the moment the `_` arm
-    /// answers `true`.
+    /// produce. This used to fall to `same_window`'s `_` arm, answer "new
+    /// window", zero `highest_fired` and re-announce on that same poll — so a
+    /// field that flapped fired on every other poll. Both the disappearance
+    /// and the return are checked here, because the old bug needed both to
+    /// sustain itself.
     #[test]
-    fn a_resets_at_that_appears_or_disappears_counts_as_a_new_window() {
+    fn a_resets_at_that_flaps_announces_once_not_on_every_other_poll() {
         let mut notifier = Notifier::new();
         let window = reset_at(10);
         notifier.evaluate(&[quota(0.0, window)], &THRESHOLDS); // prime past the first-sight rule
@@ -569,22 +708,66 @@ mod tests {
         assert_eq!(fired[0].threshold, 80, "80 is announced once, normally");
 
         // Same window, same 85% — but this poll carried no `resets_at`.
-        let refired = notifier.evaluate(&[quota(85.0, None)], &THRESHOLDS);
-        assert_eq!(
-            refired.len(),
-            1,
-            "a `resets_at` going missing is read as a new window, so the \
-             threshold re-arms and fires again"
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, None)], &THRESHOLDS)
+                .is_empty(),
+            "a `resets_at` going missing is a gap in the response, not a \
+             window boundary — re-announcing 80 here is a banner the user \
+             has already seen for a window that never reset"
         );
-        assert_eq!(refired[0].threshold, 80, "the same banner, a second time");
 
-        // And back again: the timestamp returning is another window change.
-        assert_eq!(
-            notifier.evaluate(&[quota(85.0, window)], &THRESHOLDS).len(),
-            1,
-            "the return trip is a window change too, so a server that flaps \
-             this field fires on every other poll"
+        // And back again, at the very timestamp it left. The anchor has to
+        // have survived the gap for this to stay quiet: had the `None` poll
+        // overwritten it, this one would be `(None, Some)` and — under a
+        // reading that re-arms on adoption — fire.
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, window)], &THRESHOLDS)
+                .is_empty(),
+            "the timestamp returning is not a window boundary either"
         );
+    }
+
+    /// The `(None, Some)` row, and the reason it adopts rather than keeps.
+    /// A quota that has never carried a `resets_at` has no anchor; the poll
+    /// where one finally arrives must stay silent — nothing about the window
+    /// changed, the server just started reporting it — but it must *record*
+    /// that timestamp. Keeping `None` instead would be silent too, and would
+    /// look correct right up until the genuine reset in the last step, which
+    /// would then compare `(None, Some)` all over again and never re-arm:
+    /// the quota would go permanently deaf.
+    #[test]
+    fn a_resets_at_that_arrives_late_anchors_without_re_arming() {
+        let mut notifier = Notifier::new();
+        let arrived = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+
+        // First sight, and a second poll, with no reset time at all.
+        notifier.evaluate(&[quota(85.0, None)], &THRESHOLDS); // primes at 85
+        assert!(notifier
+            .evaluate(&[quota(85.0, None)], &THRESHOLDS)
+            .is_empty());
+
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, Some(arrived))], &THRESHOLDS)
+                .is_empty(),
+            "the server starting to report a reset time is not a reset"
+        );
+
+        // Five hours on, a real window boundary — the shortest real window
+        // there is, so this is the closest a genuine reset can ever land.
+        let fired = notifier.evaluate(
+            &[quota(85.0, Some(arrived + chrono::Duration::hours(5)))],
+            &THRESHOLDS,
+        );
+        assert_eq!(
+            fired.len(),
+            1,
+            "the late arrival had to be adopted as the anchor, or this \
+             comparison is `(None, Some)` again and the quota never re-arms"
+        );
+        assert_eq!(fired[0].threshold, 80);
     }
 
     #[test]
