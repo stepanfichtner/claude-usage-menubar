@@ -570,4 +570,56 @@ mod tests {
             "a refresh outside a backoff should cut the wait well short of the deadline, elapsed = {elapsed:?}"
         );
     }
+
+    /// The harder case named in the brief: a refresh that lands *before*
+    /// `wait_for_next_poll` is even called (e.g. the previous poll was still
+    /// in flight when the panel was opened). `tokio::sync::Notify` stores at
+    /// most one wake for the next call to `notified()` to consume, so this
+    /// still must not shorten an active backoff — the stored wake gets
+    /// consumed and discarded by the first loop iteration, which then
+    /// re-arms `notified()` and waits for a genuinely new signal.
+    #[tokio::test]
+    async fn a_refresh_that_arrived_before_the_wait_began_does_not_shorten_a_backoff() {
+        let mut backoff = Backoff::new();
+        backoff.on_rate_limited();
+        let signal = RefreshSignal::default();
+        assert!(
+            signal.request(),
+            "the first-ever refresh is never throttled"
+        );
+
+        let wait = std::time::Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + wait;
+        let started = std::time::Instant::now();
+        wait_for_next_poll(deadline, &signal, &backoff).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(180),
+            "a pre-arrived refresh must not shorten an active backoff either, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// Same pre-arrival, outside a backoff: the stored wake should resolve
+    /// the wait almost immediately, same as a live signal would.
+    #[tokio::test]
+    async fn a_refresh_that_arrived_before_the_wait_began_still_cuts_an_ordinary_wait_short() {
+        let backoff = Backoff::new();
+        let signal = RefreshSignal::default();
+        assert!(
+            signal.request(),
+            "the first-ever refresh is never throttled"
+        );
+
+        let wait = std::time::Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + wait;
+        let started = std::time::Instant::now();
+        wait_for_next_poll(deadline, &signal, &backoff).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "a pre-arrived refresh outside a backoff should resolve almost immediately, elapsed = {elapsed:?}"
+        );
+    }
 }
