@@ -14,8 +14,12 @@ pub struct Notification {
 #[derive(Debug, Clone)]
 struct Armed {
     /// The highest level already accounted for in this window: a threshold
-    /// that fired, or — on the quota's first sight — the percentage that was
-    /// simply observed. See `primed_level`.
+    /// that fired, or a percentage this app simply observed without
+    /// announcing. Every evaluation raises it to at least the observed
+    /// percentage, so a climb watched while notifications were off is
+    /// accounted for rather than left to announce itself later. See
+    /// `primed_level`. It never falls within a window; only a new window
+    /// zeroes it.
     highest_fired: u8,
     window: Option<DateTime<Utc>>,
 }
@@ -27,9 +31,9 @@ struct Armed {
 /// hours at the shortest, so anything closer than this is the same window.
 const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
 
-/// What priming records on the first sight of a quota: the observed
-/// percentage itself, floored to a whole percent, rather than the highest
-/// configured threshold beneath it.
+/// What priming records: the observed percentage itself, floored to a whole
+/// percent, rather than the highest configured threshold beneath it. Applied
+/// on the first sight of a quota and again after every later evaluation.
 ///
 /// The distinction is invisible while notifications are on (every threshold
 /// is an integer, so the floored percentage is never below the highest one
@@ -39,6 +43,11 @@ const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
 /// and the first poll after the user switches notifications back on would
 /// then announce levels crossed while this app was watching and deliberately
 /// silent. The record has to reflect what was seen, not what was enabled.
+///
+/// This is also why the ordering in `evaluate` matters: the observed
+/// percentage is folded in *after* the crossing check, never before. Folded
+/// in first it would swallow every crossing, since the highest threshold at
+/// or below a percentage can never exceed that percentage floored.
 fn primed_level(percent: f64) -> u8 {
     // `as u8` on a float saturates rather than wrapping, and every threshold
     // is <= 100, so clamping here only makes the stored value readable as the
@@ -64,8 +73,9 @@ fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -
 /// Notifies on transitions this app has observed, not on state it inherited
 /// at startup (spec §10.2): the first `evaluate` call for a given quota id
 /// primes whatever it was already at as silently announced, rather than
-/// firing for it — and primes it from the observed percentage, so the record
-/// holds even if notifications were off at the time (`primed_level`). This matters for two reasons — a fresh install should not
+/// firing for it — and every evaluation, first or not, primes from the
+/// observed percentage, so the record holds even if notifications were off at
+/// the time (`primed_level`). This matters for two reasons — a fresh install should not
 /// carpet-bomb someone who was already at 85% with banners for 50 and 80, and
 /// on macOS a first-ever launch spends its opening seconds inside the OS's own
 /// notification-authorization window, where anything posted is delivered but
@@ -120,6 +130,15 @@ impl Notifier {
                             });
                         }
                     }
+
+                    // Account for what was observed, whether or not a
+                    // threshold was crossed. With notifications off the
+                    // threshold list is empty and `crossed` is always `None`,
+                    // so without this the record would stand still through a
+                    // whole muted climb and the first armed poll afterwards
+                    // would announce it. `max` keeps it from ever falling
+                    // within a window; only a new window zeroes it.
+                    entry.highest_fired = entry.highest_fired.max(primed_level(quota.percent));
                 }
             }
         }
@@ -315,6 +334,46 @@ mod tests {
 
         // Crossing 90 afterwards is still a transition this app observed, so
         // priming must not have swallowed the whole window either.
+        let fired = notifier.evaluate(&[quota(92.0, reset_at(10))], &THRESHOLDS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].threshold, 90);
+    }
+
+    /// The third door into the priming rule, and the one first sight cannot
+    /// cover. Priming on the *first* sight of a quota already records the
+    /// observed percentage, but every later poll only ever advanced
+    /// `highest_fired` from a crossed threshold — and with notifications off
+    /// the threshold list is empty, so nothing is ever crossed and the record
+    /// froze at whatever the quota happened to stand at when the app started.
+    /// A quota that then climbed while muted would announce that climb on the
+    /// first poll after the switch came back on.
+    ///
+    /// The climb has to span two muted polls: a single muted poll is the
+    /// first-sight case, which `primed_level` has handled since batch A.
+    #[test]
+    fn a_climb_across_several_muted_polls_stays_silent_when_notifications_return() {
+        let mut notifier = Notifier::new();
+        // Notifications off: `settings::sanitized()` hands over an empty list.
+        assert!(notifier
+            .evaluate(&[quota(40.0, reset_at(10))], &[])
+            .is_empty());
+        // Still off, and now past 50 and 80. The tray icon and the panel
+        // showed this the whole time; only the banners were suppressed.
+        assert!(notifier
+            .evaluate(&[quota(85.0, reset_at(10))], &[])
+            .is_empty());
+
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS)
+                .is_empty(),
+            "50 and 80 were crossed while this app watched and stayed \
+             deliberately silent, so switching notifications on must prime \
+             from what was observed rather than announce it retroactively"
+        );
+
+        // ...and the fix cannot be a blanket mute of the poll after the
+        // switch: a threshold crossed while armed still has to fire.
         let fired = notifier.evaluate(&[quota(92.0, reset_at(10))], &THRESHOLDS);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].threshold, 90);
