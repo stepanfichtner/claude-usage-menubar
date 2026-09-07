@@ -69,11 +69,16 @@ fn set_settings(app: tauri::AppHandle, settings: settings::Settings) -> Result<(
     settings::save(&app, &settings)?;
 
     let manager = app.autolaunch();
-    let _ = if settings.launch_at_login {
+    let autostart_result = if settings.launch_at_login {
         manager.enable()
     } else {
         manager.disable()
     };
+    // A failure here means the store now says `launch_at_login` but the
+    // LaunchAgent/.desktop file does not match it — that divergence has to
+    // reach the caller rather than being swallowed, so the settings UI can
+    // show it instead of silently lying about what took effect.
+    autostart_result.map_err(|e| e.to_string())?;
 
     if let Some(signal) = {
         use tauri::Manager;
@@ -109,12 +114,21 @@ pub fn run() {
             get_settings,
             set_settings
         ])
-        .on_window_event(|window, event| {
-            if window.label() == "popover" {
+        .on_window_event(|window, event| match window.label() {
+            "popover" => {
                 if let tauri::WindowEvent::Focused(false) = event {
                     let _ = window.hide();
                 }
             }
+            // Closing destroys a window, after which open_settings finds nothing
+            // and the menu item silently stops working. Hide instead.
+            "settings" => {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

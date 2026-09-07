@@ -3,21 +3,41 @@
   import QuotaCard from "./lib/QuotaCard.svelte";
   import { now, snapshot } from "./lib/stores";
 
+  const STALE_WARNING_SECS = 5 * 60;
+
+  // `stale` means "no live fetch has succeeded since launch" — true only for
+  // the cached snapshot served at cold start, before the first live poll
+  // lands. Once a live (non-stale) snapshot has arrived this session, it
+  // cannot mean that any more, so track it independently rather than trusting
+  // any single event's flag.
+  let hasLiveSnapshot = $state(false);
+  $effect(() => {
+    if ($snapshot && !$snapshot.snapshot.stale) hasLiveSnapshot = true;
+  });
+
+  const ageSeconds = $derived.by(() => {
+    const fetchedAt = $snapshot?.snapshot.fetchedAt;
+    if (!fetchedAt) return 0;
+    return Math.max(0, Math.floor(($now.getTime() - new Date(fetchedAt).getTime()) / 1000));
+  });
+
   // Elapsed time, computed directly. Reusing formatLong here would be wrong:
   // it answers "how long until this timestamp", and for one already in the past
   // it returns "now" — rendering "updated now ago".
   const age = $derived.by(() => {
-    const fetchedAt = $snapshot?.snapshot.fetchedAt;
-    if (!fetchedAt) return "";
-    const seconds = Math.max(
-      0,
-      Math.floor(($now.getTime() - new Date(fetchedAt).getTime()) / 1000),
-    );
+    const seconds = ageSeconds;
     if (seconds < 60) return `updated ${seconds}s ago`;
     const minutes = Math.floor(seconds / 60);
     if (minutes < 60) return `updated ${minutes}m ago`;
     return `updated ${Math.floor(minutes / 60)}h ago`;
   });
+
+  // The genuine cold-start case only: cached data, and no live snapshot has
+  // arrived yet. A poll that merely failed (rate limited, offline) no longer
+  // touches `stale` at all, so it never lands here — the footer just keeps
+  // counting up the age of the last good snapshot instead.
+  const showingCachedData = $derived(!hasLiveSnapshot && ($snapshot?.snapshot.stale ?? false));
+  const footerIsWarning = $derived(showingCachedData || ageSeconds > STALE_WARNING_SECS);
 </script>
 
 <main>
@@ -40,8 +60,8 @@
     {#each $snapshot.snapshot.quotas as quota (quota.id)}
       <QuotaCard {quota} now={$now} />
     {/each}
-    <footer class:stale={$snapshot.snapshot.stale}>
-      {$snapshot.snapshot.stale ? "showing cached data" : age}
+    <footer class:stale={footerIsWarning}>
+      {showingCachedData ? "showing cached data" : age}
     </footer>
   {/if}
 </main>

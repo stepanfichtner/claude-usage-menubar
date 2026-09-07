@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::tray::TitleEntry;
@@ -47,7 +47,12 @@ impl Settings {
     }
 }
 
-pub fn load(app: &AppHandle) -> Settings {
+// Generic over the Tauri runtime, not just `AppHandle` (= `AppHandle<Wry>`),
+// so tests can drive this against `tauri::test`'s `MockRuntime` instead of a
+// real webview. Every production call site passes a concrete `&AppHandle`
+// (Wry), which still satisfies this bound with `R` inferred, so nothing
+// downstream changes.
+pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let Ok(store) = app.store(STORE_FILE) else {
         return Settings::default();
     };
@@ -58,7 +63,7 @@ pub fn load(app: &AppHandle) -> Settings {
         .sanitized()
 }
 
-pub fn save(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> Result<(), String> {
     let sanitized = settings.clone().sanitized();
     let store = app.store(STORE_FILE).map_err(|e| e.to_string())?;
     store.set(
@@ -160,5 +165,75 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, Settings::default());
+    }
+
+    /// `sanitized()` is applied on both `load` and `save`, so a value that has
+    /// already been through it once must come out unchanged the second time —
+    /// otherwise the two call sites could keep nudging a value further on
+    /// every round trip.
+    #[test]
+    fn sanitized_is_idempotent() {
+        let once = Settings {
+            poll_interval_secs: 5,
+            thresholds: vec![90, 50, 50, 0, 101, 80],
+            ..Settings::default()
+        }
+        .sanitized();
+        let twice = once.clone().sanitized();
+        assert_eq!(once, twice);
+    }
+
+    /// Restores the previous `HOME` on drop, even if the test panics, so one
+    /// test's temp-directory override can never leak into another. Nothing
+    /// else in this crate's test suite reads `HOME` (only
+    /// `credentials::read_raw`'s non-macOS path does, and its tests never call
+    /// it), so serial access to the env var is not a concern here.
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn scoped_to(dir: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// A real `tauri::test::MockRuntime` app with the real `tauri-plugin-store`
+    /// registered — not a hand-rolled substitute. Call this only after
+    /// scoping `HOME` (see `HomeGuard`), so its resolved app-data directory
+    /// can never land in a real one.
+    fn mock_app_with_store() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .plugin(tauri_plugin_store::Builder::new().build())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app")
+    }
+
+    #[test]
+    fn load_survives_a_corrupt_store_file_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::scoped_to(dir.path());
+        let app = mock_app_with_store();
+        let handle = app.handle();
+
+        // Seed the exact file the store plugin will read, with content that
+        // is not valid JSON at all, before the plugin ever touches it — this
+        // is what a hand-edited or half-written store file looks like from
+        // the plugin's point of view on its very first read.
+        let data_dir = tauri::Manager::path(handle).app_data_dir().unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join(STORE_FILE), b"{ this is not valid json !!!").unwrap();
+
+        let loaded = load(handle);
+        assert_eq!(loaded, Settings::default());
     }
 }

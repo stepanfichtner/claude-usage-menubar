@@ -30,3 +30,7 @@ dirs = "7"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+# Enables `tauri::test` (MockRuntime) for settings::tests only. Dev-dependency
+# feature unification means this never reaches the shipped binary — `cargo
+# build --release` does not pull in dev-dependencies at all.
+tauri = { version = "2.11", features = ["test"] }

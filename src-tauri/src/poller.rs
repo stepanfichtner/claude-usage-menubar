@@ -182,6 +182,11 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
         // Serve the cached snapshot immediately so the UI is never empty.
+        // `cache::load_snapshot` always marks it `stale: true` — it has not
+        // been confirmed by a live fetch yet this session, which is the one
+        // genuine meaning of the flag. A live fetch below always publishes
+        // with `stale: false`, and nothing in this loop sets it back to true
+        // afterwards.
         let mut profile = cache::load_profile(&cache_dir).map(|(p, _)| p);
         let mut profile_fetched_at = cache::load_profile(&cache_dir).map(|(_, at)| at);
         if let Some(cached) = cache::load_snapshot(&cache_dir) {
@@ -190,7 +195,6 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         }
 
         let signal = app.state::<Arc<RefreshSignal>>().inner().clone();
-        let mut last_snapshot: Option<UsageSnapshot> = None;
 
         loop {
             let token = credentials::read_token().ok();
@@ -242,9 +246,15 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                     }
 
                     emit(&app, &snapshot, &profile, false);
-                    last_snapshot = Some(snapshot);
                 }
                 Decision::Wait => {
+                    // A failed poll (rate limited, network error) re-emits
+                    // nothing: the frontend ticks its own age clock from the
+                    // last snapshot it has, so there is nothing new to say.
+                    // Re-emitting here previously flipped a perfectly fresh
+                    // snapshot's `stale` flag to true on every rate-limited
+                    // retry — including the one the panel's own open-triggered
+                    // refresh causes — which is not what `stale` is for.
                     if auth == AuthState::SignedOut {
                         let empty = UsageSnapshot {
                             quotas: Vec::new(),
@@ -253,14 +263,6 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                         };
                         crate::tray::apply(&app, &empty);
                         emit(&app, &empty, &profile, true);
-                    } else if let Some(previous) = &last_snapshot {
-                        // Spec §7: keep showing the last figures, but say they
-                        // are no longer fresh.
-                        let stale = UsageSnapshot {
-                            stale: true,
-                            ..previous.clone()
-                        };
-                        emit(&app, &stale, &profile, false);
                     }
                 }
             }
