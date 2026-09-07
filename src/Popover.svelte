@@ -11,6 +11,14 @@
 
   const STALE_WARNING_SECS = 5 * 60;
 
+  // Read once at startup from Cargo.toml's version via the `app_version`
+  // command. Empty until it resolves, and the footer simply omits it in that
+  // window rather than rendering a placeholder that flashes.
+  let version = $state("");
+  invoke<string>("app_version")
+    .then((v) => (version = v))
+    .catch(() => {});
+
   // The window's fixed width, matching `tauri.conf.json`'s popover window —
   // only the height ever changes. Bounds are a sane floor/ceiling so a
   // pathological snapshot (zero quotas, or fifty of them) can't produce an
@@ -82,10 +90,23 @@
   // it returns "now" — rendering "updated now ago".
   const age = $derived.by(() => {
     const seconds = ageSeconds;
+    // "updated 0s ago" is what a refresh that just landed used to say. The
+    // number is accurate and reads as broken, so the first ten seconds get
+    // words instead.
+    if (seconds < 10) return "updated just now";
     if (seconds < 60) return `updated ${seconds}s ago`;
     const minutes = Math.floor(seconds / 60);
     if (minutes < 60) return `updated ${minutes}m ago`;
     return `updated ${Math.floor(minutes / 60)}h ago`;
+  });
+
+  // The exact timestamp, on hover. The relative age answers "is this current?"
+  // at a glance; this answers "current as of when?" without spending a line of
+  // a 320px panel on it.
+  const fetchedAtLabel = $derived.by(() => {
+    const fetchedAt = $snapshot?.snapshot.fetchedAt;
+    if (!fetchedAt) return "";
+    return new Date(fetchedAt).toLocaleString();
   });
 
   // The genuine cold-start case only: cached data, and no live snapshot has
@@ -179,7 +200,12 @@
     {#if showingCachedData}
       <Callout tone="warning">Showing cached data</Callout>
     {/if}
-    <footer class:stale={footerIsWarning}>{age}</footer>
+    <footer class:stale={footerIsWarning}>
+      <span class="freshness" title={fetchedAtLabel}>
+        <span class="dot"></span>{age}
+      </span>
+      {#if version}<span class="version">v{version}</span>{/if}
+    </footer>
   {/if}
 </main>
 
@@ -258,6 +284,40 @@
   }
   .ring-meta { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
 
-  footer { padding: 10px 14px 6px; font-size: 11px; color: var(--fg-muted); }
+  /* A status bar, not a caption: the rule separates it from the quotas above,
+     and the two ends answer different questions — how fresh the numbers are,
+     and which build is showing them. */
+  footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 4px;
+    padding: 8px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--fg-muted);
+  }
+  .freshness { display: inline-flex; align-items: center; gap: 6px; }
+  /* Inherits the footer's colour, so it turns amber with the text when the
+     snapshot goes stale rather than needing its own rule. */
+  .dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.5;
+    flex: none;
+  }
   footer.stale { color: var(--warning); }
+  footer.stale .dot { opacity: 1; }
+  /* Pinned to the muted ink rather than inheriting: when the snapshot goes
+     stale the footer turns amber, and that warning is about the data's age.
+     Letting the version turn amber with it would claim something is wrong
+     with the build. */
+  .version {
+    color: var(--fg-muted);
+    opacity: 0.8;
+    font-variant-numeric: tabular-nums;
+  }
 </style>

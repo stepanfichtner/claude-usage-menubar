@@ -270,10 +270,14 @@
   }
   input[type="number"] { width: 60px; }
 
+  /* One threshold per row. They wrapped into an uneven grid before, which
+     made "+ Add" look like a fourth threshold on the second line and left the
+     reading order ambiguous — a stacked list is scanned top to bottom and the
+     add button is unmistakably the end of it. */
   .thresholds {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
+    flex-direction: column;
+    align-items: flex-start;
     gap: 6px;
     margin: 8px 0 0 24px;
   }

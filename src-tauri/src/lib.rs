@@ -64,6 +64,16 @@ fn get_settings(app: tauri::AppHandle) -> settings::Settings {
     settings::load(&app)
 }
 
+/// The version the popover footer shows. Read from `CARGO_PKG_VERSION` rather
+/// than `package.json`, because `src-tauri/Cargo.toml` is the version the
+/// release workflow checks the tag against and the one the updater compares —
+/// sourcing the footer anywhere else would let the number a user reads drift
+/// from the number that decides whether they get an update.
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[tauri::command]
 fn set_settings(app: tauri::AppHandle, settings: settings::Settings) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -116,7 +126,8 @@ pub fn run() {
             refresh_now,
             open_settings,
             get_settings,
-            set_settings
+            set_settings,
+            app_version
         ])
         .on_window_event(|window, event| match window.label() {
             "popover" => {
