@@ -16,9 +16,27 @@ struct Armed {
     window: Option<DateTime<Utc>>,
 }
 
+/// The server recomputes `resets_at` per request rather than returning a fixed
+/// window end, so it wobbles between polls inside one window — observed
+/// crossing a minute boundary, which is why truncating to the minute does not
+/// work either. A genuine reset jumps it forward by the whole window, five
+/// hours at the shortest, so anything closer than this is the same window.
+const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
+
+fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
+    match (stored, incoming) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a - b).num_seconds().abs() < SAME_WINDOW_TOLERANCE_SECS,
+        _ => false,
+    }
+}
+
 /// Remembers, per quota, the highest threshold already announced for the
 /// current window. Dropping back below a threshold does not re-arm it — only a
-/// new window does (spec §10).
+/// new window does (spec §10). The window's anchor is the `resets_at` first
+/// seen for it and is kept fixed for as long as `same_window` holds, since the
+/// server's value wobbles a little on every poll rather than staying fixed
+/// (spec §10.1).
 #[derive(Debug, Default)]
 pub struct Notifier {
     state: HashMap<String, Armed>,
@@ -37,7 +55,7 @@ impl Notifier {
                 window: quota.resets_at,
             });
 
-            if entry.window != quota.resets_at {
+            if !same_window(entry.window, quota.resets_at) {
                 entry.window = quota.resets_at;
                 entry.highest_fired = 0;
             }
@@ -179,5 +197,119 @@ mod tests {
         weekly.label = "Week · all models".into();
         let fired = notifier.evaluate(&[quota(55.0, reset_at(10)), weekly], &THRESHOLDS);
         assert_eq!(fired.len(), 2);
+    }
+
+    /// The server recomputes `resets_at` per request, so it wobbles between
+    /// polls. Exact equality reads that as a new window and re-fires every
+    /// notification on every poll — verified against the live API, where three
+    /// polls four seconds apart straddled a minute boundary.
+    #[test]
+    fn sub_second_jitter_in_resets_at_is_the_same_window() {
+        let mut notifier = Notifier::new();
+        let first = Utc.with_ymd_and_hms(2026, 9, 7, 15, 59, 59).unwrap()
+            + chrono::Duration::milliseconds(998);
+        let second = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(376);
+
+        assert_eq!(
+            notifier
+                .evaluate(&[quota(55.0, Some(first))], &THRESHOLDS)
+                .len(),
+            1
+        );
+        assert!(
+            notifier
+                .evaluate(&[quota(55.0, Some(second))], &THRESHOLDS)
+                .is_empty(),
+            "jitter across a minute boundary must not re-arm the threshold"
+        );
+    }
+
+    #[test]
+    fn a_quota_with_no_reset_time_does_not_re_arm() {
+        let mut notifier = Notifier::new();
+        assert_eq!(
+            notifier.evaluate(&[quota(55.0, None)], &THRESHOLDS).len(),
+            1
+        );
+        assert!(notifier
+            .evaluate(&[quota(58.0, None)], &THRESHOLDS)
+            .is_empty());
+    }
+
+    /// A real reset moves the window forward by hours, not milliseconds.
+    #[test]
+    fn a_genuine_window_change_still_re_arms() {
+        let mut notifier = Notifier::new();
+        let now = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+        notifier.evaluate(&[quota(95.0, Some(now))], &THRESHOLDS);
+        assert!(
+            notifier
+                .evaluate(
+                    &[quota(5.0, Some(now + chrono::Duration::hours(5)))],
+                    &THRESHOLDS
+                )
+                .is_empty(),
+            "5% is below every threshold"
+        );
+        let fired = notifier.evaluate(
+            &[quota(55.0, Some(now + chrono::Duration::hours(5)))],
+            &THRESHOLDS,
+        );
+        assert_eq!(fired[0].threshold, 50, "the new window must have re-armed");
+    }
+
+    /// Keying by position instead of by id would let two quotas inherit each
+    /// other's fired state when the server reorders them.
+    #[test]
+    fn state_follows_the_quota_id_not_its_position() {
+        let mut notifier = Notifier::new();
+        let mut weekly = quota(55.0, reset_at(10));
+        weekly.id = "weekly_all".into();
+        weekly.label = "Week · all models".into();
+        let session = quota(55.0, reset_at(10));
+
+        assert_eq!(
+            notifier
+                .evaluate(&[session.clone(), weekly.clone()], &THRESHOLDS)
+                .len(),
+            2
+        );
+        // Same two quotas, swapped order: both already fired, nothing new.
+        assert!(notifier
+            .evaluate(&[weekly, session], &THRESHOLDS)
+            .is_empty());
+    }
+
+    /// `state_follows_the_quota_id_not_its_position` above uses two quotas at
+    /// the same percentage, so a position-keyed bug ends up with identical
+    /// `highest_fired` at every index and the test cannot tell the two
+    /// implementations apart (verified: it still passes against a
+    /// deliberately index-keyed mutant). Here the two quotas cross different
+    /// thresholds, so swapping their order makes a position-keyed
+    /// implementation compare each quota against the *other* quota's armed
+    /// state and misfire.
+    #[test]
+    fn asymmetric_quotas_expose_position_keyed_state() {
+        let mut notifier = Notifier::new();
+        let mut weekly = quota(95.0, reset_at(10));
+        weekly.id = "weekly_all".into();
+        weekly.label = "Week · all models".into();
+        let session = quota(55.0, reset_at(10));
+
+        // First call: session arms at 50, weekly arms at 90.
+        let fired = notifier.evaluate(&[session.clone(), weekly.clone()], &THRESHOLDS);
+        assert_eq!(fired.len(), 2);
+
+        // Second call, same percentages, order swapped. Nothing crossed a new
+        // threshold, so nothing should fire — regardless of which position
+        // each quota now sits at.
+        assert!(
+            notifier
+                .evaluate(&[weekly, session], &THRESHOLDS)
+                .is_empty(),
+            "state keyed by position would compare weekly's 95% against \
+             session's armed threshold (50), and misfire"
+        );
     }
 }
