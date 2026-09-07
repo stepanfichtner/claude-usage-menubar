@@ -1,8 +1,35 @@
 :root {
-  color-scheme: light dark;
-  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --bg: rgba(28, 28, 30, 0.82);
+  --fg: #f2f2f7;
+  --fg-muted: #8e8e93;
+  --track: rgba(255, 255, 255, 0.1);
+  --hairline: rgba(255, 255, 255, 0.08);
+  --normal: #30d158;
+  --warning: #ff9f0a;
+  --critical: #ff453a;
+  --active-glow: rgba(255, 255, 255, 0.06);
+  color-scheme: dark;
 }
 
-body {
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: rgba(250, 250, 252, 0.86);
+    --fg: #1c1c1e;
+    --fg-muted: #6c6c70;
+    --track: rgba(0, 0, 0, 0.08);
+    --hairline: rgba(0, 0, 0, 0.07);
+    --active-glow: rgba(0, 0, 0, 0.04);
+    color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
   margin: 0;
+  background: transparent;
+  font: 13px/1.4 -apple-system, "Segoe UI", Ubuntu, system-ui, sans-serif;
+  color: var(--fg);
+  user-select: none;
+  overflow: hidden;
 }

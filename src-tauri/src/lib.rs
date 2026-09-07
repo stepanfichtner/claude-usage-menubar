@@ -40,6 +40,23 @@ pub fn debug_once() {
     });
 }
 
+#[tauri::command]
+fn refresh_now(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(signal) = app.try_state::<Arc<poller::RefreshSignal>>() {
+        signal.request();
+    }
+}
+
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
@@ -53,6 +70,14 @@ pub fn run() {
             tray::build(app.handle())?;
             poller::spawn(app.handle().clone(), poller::PollConfig::default());
             Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![refresh_now, open_settings])
+        .on_window_event(|window, event| {
+            if window.label() == "popover" {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
