@@ -118,13 +118,24 @@ mod tests {
     }
 
     /// Spec §12.1: no error rendering may leak token material.
+    ///
+    /// The second input matters more than the first: serde's *type mismatch* errors
+    /// quote the offending value verbatim ("invalid type: string \"sk-ant-...\""),
+    /// whereas its syntax and EOF errors carry only a line and column. An
+    /// implementation that wrapped serde's error would pass on the truncated input
+    /// and fail on this one.
     #[test]
     fn errors_never_contain_token_material() {
         let secret = "sk-ant-oat01-SECRETVALUE";
-        let json = format!(r#"{{"claudeAiOauth":{{"accessToken":"{secret}","bad"#);
-        let err = parse_token(&json).unwrap_err();
-        let rendered = format!("{err} {err:?}");
-        assert!(!rendered.contains("SECRETVALUE"), "leaked: {rendered}");
-        assert!(!rendered.contains("sk-ant"), "leaked: {rendered}");
+        let inputs = [
+            format!(r#"{{"claudeAiOauth":{{"accessToken":"{secret}","bad"#),
+            format!(r#"{{"claudeAiOauth":"{secret}"}}"#),
+        ];
+        for json in inputs {
+            let err = parse_token(&json).unwrap_err();
+            let rendered = format!("{err} {err:?}");
+            assert!(!rendered.contains("SECRETVALUE"), "leaked: {rendered}");
+            assert!(!rendered.contains("sk-ant"), "leaked: {rendered}");
+        }
     }
 }
