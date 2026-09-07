@@ -146,6 +146,28 @@ fn profile_is_due(
             .unwrap_or(true)
 }
 
+/// R56: whether this iteration should attempt a profile fetch, composing
+/// this iteration's own usage-poll `result` with the entering `backoff`
+/// state. At the call site, `decide()` has not run yet for this iteration's
+/// `result` — only `backoff`'s bookkeeping lags, not the outcome itself,
+/// which is already known. Consulting `backoff.is_backing_off()` alone was
+/// off by one iteration: it missed a rate limit that started on *this* very
+/// poll, since `on_rate_limited()` would not fold it in until `decide()` ran
+/// afterwards. Reading `result` directly closes that gap.
+fn should_fetch_profile(
+    result: &Result<Vec<Quota>, ApiError>,
+    backoff: &Backoff,
+    fetched_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    let rate_limited_now = matches!(result, Err(ApiError::RateLimited));
+    profile_is_due(
+        rate_limited_now || backoff.is_backing_off(),
+        fetched_at,
+        now,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct PollConfig {
     pub base_url: String,
@@ -234,17 +256,18 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
             // fallback until a usage poll finally succeeds. A failed profile
             // fetch stays non-fatal: nothing here changes what happens next.
             //
-            // `backoff` at this point still holds the *previous* iteration's
-            // outcome — decide() for this iteration's own `result` hasn't
-            // run yet — which is exactly the question `profile_is_due` needs
-            // answered: was the endpoint asking for quiet as of a moment
-            // ago (R55). The very first attempt (backoff still fresh,
-            // nothing decided yet) still gets a profile fetch alongside its
-            // not-yet-known usage outcome; only a *sustained* backoff holds
-            // it back, and it resumes on the next iteration after any
-            // success clears the backoff.
+            // R55/R56: not while rate-limited, though — the endpoint is
+            // asking for quiet, and a second request per cycle is the
+            // opposite of that. `result` (this iteration's usage-poll
+            // outcome) is already known at this point, eighteen lines up;
+            // what is *not* yet updated is `backoff`'s bookkeeping — decide()
+            // folds `result` into it only below. Gating on `backoff` alone
+            // would miss a rate limit that started on this very poll, so
+            // `should_fetch_profile` consults both: this iteration's own
+            // result, and whatever `backoff` was still carrying in from
+            // before it.
             let stale_profile =
-                profile_is_due(backoff.is_backing_off(), profile_fetched_at, Utc::now());
+                should_fetch_profile(&result, &backoff, profile_fetched_at, Utc::now());
             if stale_profile {
                 if let Some(token) = &token {
                     if let Ok(fresh) =
@@ -455,6 +478,79 @@ mod tests {
         #[test]
         fn not_due_while_backing_off_even_when_never_fetched() {
             assert!(!profile_is_due(true, None, Utc::now()));
+        }
+    }
+
+    /// R56: pins the actual call-site wiring, not just `profile_is_due` in
+    /// isolation. The five `profile_is_due` tests above pin the pure
+    /// predicate faithfully and could never have caught R56's bug, because
+    /// none of them touch a `Result` — the loop's `backoff.is_backing_off()`
+    /// alone was off by one iteration, missing a rate limit that started on
+    /// the very poll being evaluated (its outcome, `result`, is known at the
+    /// call site; only `backoff`'s bookkeeping for it is not, since
+    /// `decide()` runs later). `should_fetch_profile` is threaded verbatim
+    /// into `spawn()`, so these tests exercise the same composition the loop
+    /// runs, built from a plain `Result` and a plain `Backoff` — no
+    /// `AppHandle`, no credentials, no async runtime required.
+    mod should_fetch_profile_tests {
+        use super::*;
+
+        /// The bug R56 exists for: a fresh `Backoff` (nothing decided yet)
+        /// says "not backing off", but *this* poll's own result already is
+        /// a 429. Gating on `backoff` alone (the pre-R56 behaviour) would
+        /// say "due" here — this is the exact case that slipped through
+        /// with 5 passing `profile_is_due` tests and 0 failing ones.
+        #[test]
+        fn not_due_when_this_very_poll_is_rate_limited_even_with_a_fresh_backoff() {
+            let result: Result<Vec<Quota>, ApiError> = Err(ApiError::RateLimited);
+            let backoff = Backoff::new();
+            assert!(!should_fetch_profile(&result, &backoff, None, Utc::now()));
+        }
+
+        /// The ordinary path is unaffected: a successful poll, nothing ever
+        /// fetched, no backoff in play — still due.
+        #[test]
+        fn due_when_this_poll_succeeds_and_nothing_indicates_trouble() {
+            let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
+            let backoff = Backoff::new();
+            assert!(should_fetch_profile(&result, &backoff, None, Utc::now()));
+        }
+
+        /// A backoff already active from an earlier iteration still holds
+        /// the fetch back even when *this particular* poll happened to
+        /// succeed — the OR must not let a good `result` alone override
+        /// bookkeeping that says the endpoint is still owed quiet.
+        #[test]
+        fn not_due_when_backoff_is_already_active_even_if_this_poll_succeeded() {
+            let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
+            let mut backoff = Backoff::new();
+            backoff.on_rate_limited();
+            assert!(!should_fetch_profile(&result, &backoff, None, Utc::now()));
+        }
+
+        /// Staleness still gates through the composition end to end: a
+        /// clean poll with no backoff in play, but a profile fetched
+        /// recently, is not due.
+        #[test]
+        fn not_due_when_this_poll_succeeds_but_the_profile_is_still_fresh() {
+            let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
+            let backoff = Backoff::new();
+            let fetched_at = Utc::now() - ChronoDuration::hours(PROFILE_MAX_AGE_HOURS - 1);
+            assert!(!should_fetch_profile(
+                &result,
+                &backoff,
+                Some(fetched_at),
+                Utc::now()
+            ));
+        }
+
+        /// A different kind of failure this same poll (offline, signed out)
+        /// must not trip the rate-limit term — only `RateLimited` should.
+        #[test]
+        fn a_non_rate_limit_failure_this_poll_does_not_hold_the_fetch_back_by_itself() {
+            let result: Result<Vec<Quota>, ApiError> = Err(ApiError::SignedOut);
+            let backoff = Backoff::new();
+            assert!(should_fetch_profile(&result, &backoff, None, Utc::now()));
         }
     }
 
