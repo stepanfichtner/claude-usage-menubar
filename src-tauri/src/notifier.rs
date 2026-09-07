@@ -35,9 +35,11 @@ const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
 /// percent, rather than the highest configured threshold beneath it. Applied
 /// on the first sight of a quota and again after every later evaluation.
 ///
-/// The distinction is invisible while notifications are on (every threshold
-/// is an integer, so the floored percentage is never below the highest one
-/// crossed) and load-bearing while they are off. With notifications off,
+/// The distinction is invisible while notifications are on *and the
+/// threshold list is not changing* (every threshold is an integer, so the
+/// floored percentage is never below the highest one crossed, and the two
+/// records answer every later comparison identically) and load-bearing while
+/// they are off. With notifications off,
 /// `settings::sanitized()` hands `evaluate` an empty threshold list, so
 /// nothing counts as crossed and a threshold-derived priming would record 0 —
 /// and the first poll after the user switches notifications back on would
@@ -48,6 +50,16 @@ const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
 /// percentage is folded in *after* the crossing check, never before. Folded
 /// in first it would swallow every crossing, since the highest threshold at
 /// or below a percentage can never exceed that percentage floored.
+///
+/// One consequence, since folding the observation in on every poll is
+/// stricter than folding it in only on first sight: adding a threshold
+/// *below* the quota's current usage no longer announces it. Someone sitting
+/// at 85% who has climbed there while configured for `[90]` and then adds 80
+/// stays silent, because 85 is already recorded. That is the decided rule
+/// working — 80 was crossed while this app watched and did not announce it,
+/// and turning a threshold on is no more a crossing than turning
+/// notifications on is — but it is a behaviour change from a
+/// threshold-derived record, which would have held 0 and fired.
 fn primed_level(percent: f64) -> u8 {
     // `as u8` on a float saturates rather than wrapping, and every threshold
     // is <= 100, so clamping here only makes the stored value readable as the
@@ -326,6 +338,19 @@ mod tests {
             .is_empty());
         let fired = notifier.evaluate(&[quota(55.0, reset_at(15))], &THRESHOLDS);
         assert_eq!(fired[0].threshold, 50);
+
+        // A fourth poll, still in the new window, nothing newly crossed. The
+        // backstop for `classify_window`'s reset row adopting `b`: an
+        // implementation that re-armed but kept the *stale* anchor would
+        // compare this against reset_at(10) again, call it another new
+        // window, and re-announce 50 — on every poll forever after the first
+        // reset, which is the loudest failure this module can produce.
+        assert!(
+            notifier
+                .evaluate(&[quota(55.0, reset_at(15))], &THRESHOLDS)
+                .is_empty(),
+            "a new window re-arms once, not on every poll thereafter"
+        );
     }
 
     #[test]
@@ -508,36 +533,43 @@ mod tests {
     /// while pairwise steps stay small" test would be false against the
     /// correct, shipped implementation: with the anchor fixed, drift that
     /// stays under tolerance step-to-step but exceeds it cumulatively *does*
-    /// eventually trip a fresh re-arm here — three times, in fact, across six
-    /// four-minute steps — which is the intended behaviour, not a bug. What a
-    /// refresh-every-poll bug actually produces is silence forever instead.)
+    /// eventually trip a fresh re-arm here — twice, across the five
+    /// four-minute steps the loop below takes, on the steps that land 8
+    /// minutes past the anchor of the moment. Counting the initial crossing
+    /// that precedes the loop, three notifications in all. That is the
+    /// intended behaviour, not a bug. What a refresh-every-poll bug actually
+    /// produces is silence forever instead.)
     #[test]
     fn a_slow_drift_past_the_tolerance_is_eventually_caught() {
         let mut notifier = Notifier::new();
         let t0 = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
         notifier.evaluate(&[quota(0.0, Some(t0))], &THRESHOLDS); // prime past the first-sight rule
 
-        // Six polls, four minutes apart. Every consecutive pair is well
-        // inside the 5-minute tolerance, but by the third poll the total
-        // drift from the window's first-seen anchor (8 minutes) exceeds it.
+        // Then five more polls, four minutes apart. Every consecutive pair is
+        // well inside the 5-minute tolerance, but a step landing 8 minutes
+        // past the anchor of the moment exceeds it.
         let first_fired = notifier.evaluate(&[quota(55.0, Some(t0))], &THRESHOLDS);
         assert_eq!(first_fired.len(), 1, "the initial crossing must still fire");
 
-        let mut saw_a_later_notification = false;
+        let mut re_arms = 0;
         for step in 1..6 {
             let t = t0 + chrono::Duration::minutes(4 * step);
             let fired = notifier.evaluate(&[quota(55.0, Some(t))], &THRESHOLDS);
             if !fired.is_empty() {
-                saw_a_later_notification = true;
+                re_arms += 1;
             }
         }
 
-        assert!(
-            saw_a_later_notification,
-            "cumulative drift past the tolerance must eventually re-arm the \
-             threshold — an implementation that refreshes the anchor to the \
-             latest value every poll would instead stay silent through all \
-             six steps, never noticing the drift"
+        // Asserted rather than described, so the count in the doc comment
+        // above is checked rather than merely claimed. Zero is what a
+        // refresh-the-anchor-every-poll bug produces.
+        assert_eq!(
+            re_arms, 2,
+            "cumulative drift past the tolerance must re-arm the threshold — \
+             twice across these five steps, on the two that land 8 minutes \
+             past the anchor of the moment. An implementation that refreshes \
+             the anchor to the latest value every poll would stay silent \
+             through all five, never noticing the drift"
         );
     }
 
@@ -717,16 +749,58 @@ mod tests {
              has already seen for a window that never reset"
         );
 
-        // And back again, at the very timestamp it left. The anchor has to
-        // have survived the gap for this to stay quiet: had the `None` poll
-        // overwritten it, this one would be `(None, Some)` and — under a
-        // reading that re-arms on adoption — fire.
+        // And back again, at the very timestamp it left.
         assert!(
             notifier
                 .evaluate(&[quota(85.0, window)], &THRESHOLDS)
                 .is_empty(),
             "the timestamp returning is not a window boundary either"
         );
+    }
+
+    /// That the `None` poll above stayed quiet does not by itself prove the
+    /// anchor survived it: had the gap overwritten the anchor with nothing,
+    /// the return trip would be `(None, Some)`, which does not re-arm either,
+    /// and the flap test would pass regardless. `AnchorUpdate::Keep` on the
+    /// `(Some a, None)` row only becomes observable through `evaluate` when a
+    /// *genuine* reset follows the gap.
+    ///
+    /// So: a window, a poll with no `resets_at` at all, then a real boundary
+    /// five hours on — the shortest real window there is. That must re-arm,
+    /// which it can only do by comparing against the anchor the gap left
+    /// alone. An implementation that dropped the anchor during the gap sees
+    /// `(None, Some)` here, adopts without re-arming, and stays silent.
+    #[test]
+    fn an_anchor_survives_a_gap_in_resets_at() {
+        let mut notifier = Notifier::new();
+        let first = Utc.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap();
+
+        notifier.evaluate(&[quota(0.0, Some(first))], &THRESHOLDS); // prime past the first-sight rule
+        assert_eq!(
+            notifier
+                .evaluate(&[quota(85.0, Some(first))], &THRESHOLDS)
+                .len(),
+            1,
+            "80 is announced once, normally"
+        );
+
+        // The gap.
+        assert!(notifier
+            .evaluate(&[quota(85.0, None)], &THRESHOLDS)
+            .is_empty());
+
+        // A real reset, measured from the anchor the gap must not have eaten.
+        let fired = notifier.evaluate(
+            &[quota(85.0, Some(first + chrono::Duration::hours(5)))],
+            &THRESHOLDS,
+        );
+        assert_eq!(
+            fired.len(),
+            1,
+            "the gap must have kept the anchor — dropping it makes this \
+             `(None, Some)`, which adopts without re-arming and never fires"
+        );
+        assert_eq!(fired[0].threshold, 80);
     }
 
     /// The `(None, Some)` row, and the reason it adopts rather than keeps.
