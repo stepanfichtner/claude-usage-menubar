@@ -124,14 +124,12 @@ pub const PROFILE_MAX_AGE_HOURS: i64 = 24;
 
 #[derive(Debug, Clone)]
 pub struct PollConfig {
-    pub base_interval: Duration,
     pub base_url: String,
 }
 
 impl Default for PollConfig {
     fn default() -> Self {
         Self {
-            base_interval: Duration::from_secs(60),
             base_url: usage::API_BASE.to_string(),
         }
     }
@@ -267,7 +265,8 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                 }
             }
 
-            let delay = backoff.next_delay(config.base_interval);
+            let interval = Duration::from_secs(crate::settings::load(&app).poll_interval_secs);
+            let delay = backoff.next_delay(interval);
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = signal.notified() => {}

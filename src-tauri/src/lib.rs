@@ -58,11 +58,41 @@ fn open_settings(app: tauri::AppHandle) {
     }
 }
 
+#[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> settings::Settings {
+    settings::load(&app)
+}
+
+#[tauri::command]
+fn set_settings(app: tauri::AppHandle, settings: settings::Settings) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    settings::save(&app, &settings)?;
+
+    let manager = app.autolaunch();
+    let _ = if settings.launch_at_login {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+
+    if let Some(signal) = {
+        use tauri::Manager;
+        app.try_state::<Arc<poller::RefreshSignal>>()
+    } {
+        signal.request();
+    }
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(Arc::new(poller::RefreshSignal::default()))
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -73,7 +103,12 @@ pub fn run() {
             poller::spawn(app.handle().clone(), poller::PollConfig::default());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![refresh_now, open_settings])
+        .invoke_handler(tauri::generate_handler![
+            refresh_now,
+            open_settings,
+            get_settings,
+            set_settings
+        ])
         .on_window_event(|window, event| {
             if window.label() == "popover" {
                 if let tauri::WindowEvent::Focused(false) = event {

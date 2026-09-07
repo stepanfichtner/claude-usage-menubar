@@ -28,4 +28,12 @@ export default defineConfig(() => ({
       ignored: ['**/src-tauri/**'],
     },
   },
+  build: {
+    rollupOptions: {
+      input: {
+        popover: "index.html",
+        settings: "settings.html",
+      },
+    },
+  },
 }))

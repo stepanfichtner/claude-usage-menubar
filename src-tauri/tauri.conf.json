@@ -26,6 +26,15 @@
         "skipTaskbar": true,
         "visible": false,
         "shadow": true
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "Claude Usage — Settings",
+        "width": 420,
+        "height": 520,
+        "resizable": false,
+        "visible": false
       }
     ],
     "security": {
