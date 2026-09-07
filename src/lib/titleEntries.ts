@@ -54,6 +54,12 @@ export interface SnapshotStanding {
   /** True for the snapshot replayed from cache at launch. */
   stale: boolean;
   signedOut: boolean;
+  /**
+   * `UsageSnapshot::fetched_at`, stamped `Utc::now()` once per emit by the
+   * poller, so it identifies the snapshot. `retireAbsentEntries` ignores it;
+   * `reconcileTitleEntries` uses it to count each snapshot exactly once.
+   */
+  fetchedAt: string;
 }
 
 /** Absence tallies, keyed by quota id. Absent key means "seen recently". */
@@ -112,4 +118,63 @@ export function retireAbsentEntries(
   const gone = new Set(retired.map((e) => e.quotaId));
   for (const id of gone) delete next[id];
   return { entries: entries.filter((e) => !gone.has(e.quotaId)), absences: next };
+}
+
+/**
+ * What the settings window carries between snapshots so that retirement can
+ * be judged across several of them.
+ */
+export interface RetirementState {
+  absences: Absences;
+  /** `fetchedAt` of the snapshot the tally last advanced on. */
+  countedAt: string | null;
+}
+
+export const NO_RETIREMENT_YET: RetirementState = { absences: {}, countedAt: null };
+
+/**
+ * Merge, then retire — the whole rule the settings window applies to one
+ * snapshot, in one place so it can be tested. The `$effect` that calls this
+ * is a thin wrapper around it.
+ *
+ * The `countedAt` guard is the point. The effect reads
+ * `settings.titleEntries` and writes its own result back, and
+ * `mergeTitleEntries` returns a *fresh* array whenever it appends — so a
+ * snapshot that adds an entry writes a new reference, re-triggers the effect
+ * that read it, and reaches this function a second time for the same
+ * snapshot. Without the guard that second pass advances every absent entry's
+ * tally again, and `RETIREMENT_MISSES` consecutive snapshots becomes two
+ * rather than three.
+ *
+ * That is not a hypothetical pairing: the add path *is* the flap. A poll
+ * that drops `weekly:Fable` for `weekly:scoped` appends an entry (fresh
+ * array, double count) in the same breath as it starts `weekly:Fable`'s
+ * tally.
+ *
+ * Counting per snapshot rather than per call also means this holds however
+ * many times the effect happens to run — the identity of `fetchedAt` is the
+ * guarantee, not the scheduler's behaviour.
+ *
+ * `entries` comes back by identity when nothing changed, which is what keeps
+ * the caller's effect from re-running indefinitely.
+ */
+export function reconcileTitleEntries(
+  entries: TitleEntry[],
+  standing: SnapshotStanding | null | undefined,
+  state: RetirementState,
+): { entries: TitleEntry[]; state: RetirementState } {
+  const merged = mergeTitleEntries(entries, standing?.quotas ?? []);
+
+  // No snapshot says nothing about absence; a snapshot already counted says
+  // nothing new. Merging still happens in both cases — adding a row for a
+  // quota that exists is not the risky half.
+  if (!standing || standing.fetchedAt === state.countedAt) {
+    return { entries: merged, state };
+  }
+
+  const retirement = retireAbsentEntries(merged, standing, state.absences);
+  return {
+    entries: retirement.entries,
+    state: { absences: retirement.absences, countedAt: standing.fetchedAt },
+  };
 }

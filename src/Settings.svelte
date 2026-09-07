@@ -2,9 +2,9 @@
   import { invoke } from "@tauri-apps/api/core";
   import { now, snapshot } from "./lib/stores";
   import {
-    mergeTitleEntries,
-    retireAbsentEntries,
-    type Absences,
+    NO_RETIREMENT_YET,
+    reconcileTitleEntries,
+    type RetirementState,
     type TitleEntry,
   } from "./lib/titleEntries";
   import { nextThreshold } from "./lib/thresholds";
@@ -53,12 +53,11 @@
     }
   });
 
-  // Consecutive-absence tallies for `retireAbsentEntries`, deliberately a
-  // plain `let` and not `$state`: nothing renders it, and writing reactive
-  // state from the effect that reads it would re-trigger the effect. It
-  // starts empty every time this window's webview is created, which only
-  // ever makes retirement slower.
-  let absences: Absences = {};
+  // Retirement bookkeeping, deliberately a plain `let` and not `$state`:
+  // nothing renders it, and writing reactive state from the effect that reads
+  // it would re-trigger the effect. It starts empty every time this window's
+  // webview is created, which only ever makes retirement slower.
+  let retirement: RetirementState = NO_RETIREMENT_YET;
 
   // One row per quota the app currently knows about, in addition to the ones
   // already in titleEntries — otherwise a quota that was never added to the
@@ -68,23 +67,29 @@
   // untouched rather than wiping them, and an entry whose quota is missing
   // from this particular snapshot survives too.
   //
-  // `retireAbsentEntries` is the bounded exception: an entry still missing
-  // after `RETIREMENT_MISSES` consecutive live, non-empty, non-signed-out
-  // snapshots is dropped, so a quota retired by a plan change stops showing
-  // a raw id above two checkboxes that cannot do anything. It keeps R43 —
-  // every untrustworthy snapshot returns everything untouched — and it only
-  // changes the in-memory list; nothing reaches the store until Save.
+  // Retirement is the bounded exception: an entry still missing after
+  // `RETIREMENT_MISSES` consecutive live, non-empty, non-signed-out snapshots
+  // is dropped, so a quota retired by a plan change stops showing a raw id
+  // above two checkboxes that cannot do anything. It keeps R43 — every
+  // untrustworthy snapshot returns everything untouched — and it only changes
+  // the in-memory list; nothing reaches the store until Save.
+  //
+  // This effect can run more than once per snapshot: it reads
+  // `settings.titleEntries` and writes it back, and `mergeTitleEntries`
+  // returns a fresh array whenever it appends, so an append re-triggers the
+  // read. `reconcileTitleEntries` counts each snapshot once by `fetchedAt`
+  // rather than once per call, so the tally does not depend on how often this
+  // runs; the whole rule lives there and is tested there.
   $effect(() => {
     if (!settings) return;
     const event = $snapshot;
-    const merged = mergeTitleEntries(settings.titleEntries, event?.snapshot.quotas ?? []);
-    const retirement = retireAbsentEntries(
-      merged,
+    const next = reconcileTitleEntries(
+      settings.titleEntries,
       event && { ...event.snapshot, signedOut: event.signedOut },
-      absences,
+      retirement,
     );
-    absences = retirement.absences;
-    settings.titleEntries = retirement.entries;
+    retirement = next.state;
+    settings.titleEntries = next.entries;
   });
 
   function labelFor(quotaId: string): string {
