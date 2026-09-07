@@ -1,0 +1,8 @@
+{
+  "limits": [
+    { "kind": "session", "group": "session", "percent": 95, "severity": "normal",
+      "resets_at": "2026-09-07T10:59:59.806348+00:00", "scope": null, "is_active": true },
+    { "kind": "weekly_all", "group": "weekly", "percent": 10, "severity": "critical",
+      "resets_at": "2026-09-14T02:59:59.806369+00:00", "scope": null, "is_active": false }
+  ]
+}

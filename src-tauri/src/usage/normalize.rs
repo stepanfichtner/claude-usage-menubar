@@ -168,6 +168,15 @@ mod tests {
     }
 
     #[test]
+    fn effective_severity_is_composed_inside_normalize() {
+        let quotas = normalize(&load("usage_severity_mismatch.json"));
+        // Server says normal, 95% derives Critical — the higher wins.
+        assert_eq!(quotas[0].severity, Severity::Critical);
+        // Server says critical, 10% derives Normal — the higher still wins.
+        assert_eq!(quotas[1].severity, Severity::Critical);
+    }
+
+    #[test]
     fn derived_severity_boundaries() {
         assert_eq!(Severity::from_percent(49.9), Severity::Normal);
         assert_eq!(Severity::from_percent(50.0), Severity::Warning);
