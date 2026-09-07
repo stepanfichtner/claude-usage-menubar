@@ -130,6 +130,22 @@ use crate::{cache, credentials, profile as profile_api, usage};
 
 pub const PROFILE_MAX_AGE_HOURS: i64 = 24;
 
+/// Whether the profile is due for a re-fetch this cycle: stale (or never
+/// fetched) by `PROFILE_MAX_AGE_HOURS`, and — R55 — not while `backing_off`
+/// is true. The endpoint is asking for quiet during a backoff, and a second
+/// request per cycle is the opposite of that; the plan changes a few times a
+/// year at most (spec §4.5), so waiting out the backoff costs nothing here.
+fn profile_is_due(
+    backing_off: bool,
+    fetched_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    !backing_off
+        && fetched_at
+            .map(|at| now - at > ChronoDuration::hours(PROFILE_MAX_AGE_HOURS))
+            .unwrap_or(true)
+}
+
 #[derive(Debug, Clone)]
 pub struct PollConfig {
     pub base_url: String,
@@ -211,17 +227,24 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                 None => Err(crate::error::ApiError::SignedOut),
             };
 
-            // The plan changes a few times a year at most (spec §4.5). This
-            // runs whenever a token was readable, independent of whether the
-            // usage poll itself succeeded: a signed-out, offline or
-            // rate-limited usage poll must not also starve the profile of the
-            // one thing it needs, or the panel header sits on the "Claude
-            // usage" fallback until a usage poll finally succeeds — which
-            // under a sustained backoff can be a long wait. A failed profile
+            // This runs whenever a token was readable, independent of
+            // whether the usage poll itself succeeded: a signed-out or
+            // offline usage poll must not also starve the profile of the one
+            // thing it needs, or the panel header sits on the "Claude usage"
+            // fallback until a usage poll finally succeeds. A failed profile
             // fetch stays non-fatal: nothing here changes what happens next.
-            let stale_profile = profile_fetched_at
-                .map(|at| Utc::now() - at > ChronoDuration::hours(PROFILE_MAX_AGE_HOURS))
-                .unwrap_or(true);
+            //
+            // `backoff` at this point still holds the *previous* iteration's
+            // outcome — decide() for this iteration's own `result` hasn't
+            // run yet — which is exactly the question `profile_is_due` needs
+            // answered: was the endpoint asking for quiet as of a moment
+            // ago (R55). The very first attempt (backoff still fresh,
+            // nothing decided yet) still gets a profile fetch alongside its
+            // not-yet-known usage outcome; only a *sustained* backoff holds
+            // it back, and it resumes on the next iteration after any
+            // success clears the backoff.
+            let stale_profile =
+                profile_is_due(backoff.is_backing_off(), profile_fetched_at, Utc::now());
             if stale_profile {
                 if let Some(token) = &token {
                     if let Ok(fresh) =
@@ -386,6 +409,53 @@ mod tests {
         assert!(backoff.is_backing_off(), "still active while escalating");
         backoff.on_success();
         assert!(!backoff.is_backing_off(), "a success clears it");
+    }
+
+    /// R55: pins the composed `profile_is_due` predicate, not just its two
+    /// inputs in isolation — a rate-limited account is exactly where the
+    /// profile fetch is also likely to fail, so the backoff term has to
+    /// override staleness rather than merely combine with it.
+    mod profile_is_due_tests {
+        use super::*;
+
+        fn hours_ago(h: i64) -> DateTime<Utc> {
+            Utc::now() - ChronoDuration::hours(h)
+        }
+
+        #[test]
+        fn due_when_never_fetched_and_not_backing_off() {
+            assert!(profile_is_due(false, None, Utc::now()));
+        }
+
+        #[test]
+        fn due_when_stale_and_not_backing_off() {
+            let fetched_at = hours_ago(PROFILE_MAX_AGE_HOURS + 1);
+            assert!(profile_is_due(false, Some(fetched_at), Utc::now()));
+        }
+
+        #[test]
+        fn not_due_when_fresh_and_not_backing_off() {
+            let fetched_at = hours_ago(PROFILE_MAX_AGE_HOURS - 1);
+            assert!(!profile_is_due(false, Some(fetched_at), Utc::now()));
+        }
+
+        /// The case R55 exists for: staleness alone would say "due", but an
+        /// active backoff must override that rather than merely factor into
+        /// it — this is what would still pass if `profile_is_due` used `||`
+        /// instead of `&&`, or dropped the backoff term outright.
+        #[test]
+        fn not_due_while_backing_off_even_though_stale() {
+            let fetched_at = hours_ago(PROFILE_MAX_AGE_HOURS + 1);
+            assert!(!profile_is_due(true, Some(fetched_at), Utc::now()));
+        }
+
+        /// The narrower, worse case: never having a profile at all is the
+        /// strongest possible claim to staleness, and an active backoff
+        /// still has to win.
+        #[test]
+        fn not_due_while_backing_off_even_when_never_fetched() {
+            assert!(!profile_is_due(true, None, Utc::now()));
+        }
     }
 
     #[test]
