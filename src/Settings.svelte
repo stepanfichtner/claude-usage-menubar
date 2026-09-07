@@ -9,7 +9,6 @@
     thresholds: number[];
     notificationsEnabled: boolean;
     launchAtLogin: boolean;
-    analyticsEnabled: boolean;
   }
 
   let settings = $state<Settings | null>(null);
@@ -84,11 +83,6 @@
     <label class="check">
       <input type="checkbox" bind:checked={settings.launchAtLogin} />
       Launch at login
-    </label>
-
-    <label class="check">
-      <input type="checkbox" bind:checked={settings.analyticsEnabled} />
-      Show local token &amp; cost analytics
     </label>
 
     <fieldset>

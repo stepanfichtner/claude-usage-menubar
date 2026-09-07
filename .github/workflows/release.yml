@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Refuse tags that are not on main
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME is on main."
+          else
+            echo "::error::Tag $GITHUB_REF_NAME is not an ancestor of main. Releases are cut from main only."
+            exit 1
+          fi
+
+      - name: Refuse a tag that disagrees with Cargo.toml
+        run: |
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d'"' -f2)
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO" = "$TAG" ]; then
+            echo "Tag $GITHUB_REF_NAME matches Cargo.toml ($CARGO)."
+          else
+            echo "::error::tag $GITHUB_REF_NAME says $TAG, Cargo.toml says $CARGO"
+            exit 1
+          fi
+
+  build:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - os: ubuntu-22.04
+            args: ""
+            rust-targets: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libxdo-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Claude Usage ${{ github.ref_name }}
+          releaseBody: |
+            Unsigned builds. On macOS, right-click the app and choose Open, or run
+            `xattr -dr com.apple.quarantine "/Applications/Claude Usage.app"`.
+          releaseDraft: true
+          args: ${{ matrix.args }}

@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "reinstall": "scripts/reinstall-macos.sh"
   },
   "dependencies": {
     "@lucide/svelte": "^1.42.0",
