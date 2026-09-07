@@ -260,8 +260,25 @@ fn tooltip_line(title: &str, body: &str) -> String {
     format!("{title}: {body}")
 }
 
+/// Bounds every request the updater makes. Without it there is none: neither
+/// `check()` nor `download_and_install()` sets one, so a connection that opens
+/// and then stalls leaves the check running forever. That used to be survivable
+/// — a second click started a fresh one — but the re-entrancy guard now turns
+/// the same click into a no-op, so a wedged check would sit in the menu reading
+/// "Checking for updates…" until the app was restarted, with no way out and no
+/// explanation. A bounded request fails instead, and a failure is a state this
+/// module already knows how to show.
+///
+/// Five minutes rather than something snappier because tauri-plugin-updater
+/// 2.11.0 applies this one value to the download as well as the check
+/// (`updater.rs:504` and `:698`), and the 0.1.0 bundle is ~6 MB — a short
+/// timeout would abort legitimate slow downloads. The common failures (no
+/// route, DNS, refused connection) return in seconds regardless; this only
+/// bounds the rare stalled-mid-transfer case.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn run_check(app: &AppHandle) -> CheckOutcome {
-    let updater = match app.updater() {
+    let updater = match app.updater_builder().timeout(REQUEST_TIMEOUT).build() {
         Ok(updater) => updater,
         Err(e) => {
             return CheckOutcome::Failed {
@@ -462,6 +479,26 @@ mod tests {
     /// needs an `AppHandle`, so the guard lives here in the state machine
     /// where it can be tested: entering `Checking` twice must report one
     /// transition, not two.
+    /// The timeout has to outlast a whole bundle download, not just a metadata
+    /// fetch, because the plugin applies one value to both requests. Written as
+    /// the inequality that actually constrains it rather than as `assert_eq!`
+    /// on the constant: lowering it to something that feels responsive is the
+    /// plausible wrong move, and this is the reason that would be wrong.
+    #[test]
+    fn the_request_timeout_outlasts_a_slow_bundle_download() {
+        const BUNDLE_BYTES: u64 = 7 * 1024 * 1024;
+        const SLOW_LINK_BYTES_PER_SEC: u64 = 50 * 1024;
+        let needed = BUNDLE_BYTES / SLOW_LINK_BYTES_PER_SEC;
+        assert!(
+            REQUEST_TIMEOUT.as_secs() > needed,
+            "{}s does not cover a {} MB download at {} KB/s, which needs {}s",
+            REQUEST_TIMEOUT.as_secs(),
+            BUNDLE_BYTES / (1024 * 1024),
+            SLOW_LINK_BYTES_PER_SEC / 1024,
+            needed
+        );
+    }
+
     #[test]
     fn a_second_check_while_one_is_in_flight_does_not_start_another() {
         let status = UpdateCheckStatus::default();
