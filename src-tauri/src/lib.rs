@@ -65,6 +65,81 @@ fn get_settings(app: tauri::AppHandle) -> settings::Settings {
     settings::load(&app)
 }
 
+/// Everything the analytics scan has read so far, and how far into each file
+/// it got. Held across calls so the second and later scans read only what has
+/// been appended, rather than re-parsing hundreds of megabytes of transcript
+/// every time the panel opens.
+#[derive(Default)]
+pub struct AnalyticsState {
+    inner: std::sync::Mutex<AnalyticsInner>,
+}
+
+#[derive(Default)]
+struct AnalyticsInner {
+    offsets: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Request ids already accumulated into `entries`.
+    ///
+    /// `scan_dir` deduplicates within one call, which is enough for the
+    /// repeated lines of a single request. This set is the same guard across
+    /// calls, and it is not redundant: a transcript that is rotated or
+    /// truncated beneath us is re-read from the start by design, and without
+    /// this every request in it would be appended to `entries` a second time
+    /// and counted twice in the estimate. Entries with no request id — four
+    /// of the 31,000 usage-bearing lines on this machine — have no identity
+    /// to deduplicate on and can still be re-counted in that case.
+    seen: std::collections::HashSet<String>,
+    entries: Vec<analytics::scan::Entry>,
+}
+
+impl AnalyticsInner {
+    /// Fold one scan's output into the running set, dropping any request
+    /// already counted.
+    fn accumulate(&mut self, fresh: Vec<analytics::scan::Entry>) {
+        for entry in fresh {
+            if entry.request_id.is_empty() || self.seen.insert(entry.request_id.clone()) {
+                self.entries.push(entry);
+            }
+        }
+    }
+}
+
+/// The usage estimate built from Claude Code's local transcripts. Returns an
+/// empty summary — not an error — while the feature is switched off, so the
+/// tab has something to render and the setting is the only gate.
+#[tauri::command]
+async fn analytics_summary(app: tauri::AppHandle) -> Result<analytics::Summary, String> {
+    if !settings::load(&app).analytics_enabled {
+        return Ok(analytics::Summary::default());
+    }
+    let root = dirs::home_dir()
+        .ok_or("no home directory")?
+        .join(".claude")
+        .join("projects");
+
+    // Reading and parsing every transcript is blocking, filesystem-bound work
+    // measured in hundreds of megabytes on a well-used machine — 371 MB
+    // across 214 files here. Left on an async worker, the first scan would
+    // hold that thread for its whole duration, and the poller shares this
+    // runtime. `spawn_blocking` puts it on the pool meant for exactly this,
+    // which is what keeps the panel answering while the scan runs.
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Manager;
+        let state = app.state::<AnalyticsState>();
+        let mut guard = state
+            .inner
+            .lock()
+            .map_err(|_| "analytics state unavailable".to_string())?;
+        let fresh = analytics::scan::scan_dir(&root, &mut guard.offsets);
+        guard.accumulate(fresh);
+        Ok(analytics::summarize(&guard.entries))
+    })
+    .await
+    // Deliberately discards the join error rather than rendering it. It is
+    // the only place a panic payload from the scan could reach a string the
+    // UI shows, and nothing from a transcript may travel that way.
+    .map_err(|_| "the usage scan did not finish".to_string())?
+}
+
 /// The version the popover footer shows. Read from `CARGO_PKG_VERSION` rather
 /// than `package.json`, because `src-tauri/Cargo.toml` is the version the
 /// release workflow checks the tag against and the one the updater compares —
@@ -114,6 +189,7 @@ pub fn run() {
         .manage(Arc::new(poller::RefreshSignal::default()))
         .manage(Arc::new(updater::UpdateCheckStatus::default()))
         .manage(Arc::new(tray::LastQuotaLines::default()))
+        .manage(AnalyticsState::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.handle()
@@ -128,7 +204,8 @@ pub fn run() {
             open_settings,
             get_settings,
             set_settings,
-            app_version
+            app_version,
+            analytics_summary
         ])
         .on_window_event(|window, event| match window.label() {
             "popover" => {
@@ -148,4 +225,61 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(request_id: &str, input: u64) -> analytics::scan::Entry {
+        analytics::scan::Entry {
+            request_id: request_id.into(),
+            model: "claude-opus-5".into(),
+            timestamp: chrono::Utc::now(),
+            project: "alpha".into(),
+            input,
+            output: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cache_read: 0,
+        }
+    }
+
+    /// `scan_dir` re-reads a transcript from the start when its recorded
+    /// offset is past the end — a file rotated or truncated beneath us — and
+    /// `analytics_summary` accumulates across calls, so without this guard
+    /// that re-read would append every request a second time and double the
+    /// estimate. The second scan below is the same content again, which is
+    /// exactly what a re-read hands back.
+    #[test]
+    fn a_re_read_transcript_is_not_counted_twice() {
+        let mut inner = AnalyticsInner::default();
+        inner.accumulate(vec![entry("req_1", 10), entry("req_2", 20)]);
+        inner.accumulate(vec![entry("req_1", 10), entry("req_2", 20)]);
+
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(analytics::summarize(&inner.entries).total_tokens, 30);
+    }
+
+    #[test]
+    fn genuinely_new_requests_are_appended() {
+        let mut inner = AnalyticsInner::default();
+        inner.accumulate(vec![entry("req_1", 10)]);
+        inner.accumulate(vec![entry("req_2", 20)]);
+
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(analytics::summarize(&inner.entries).total_tokens, 30);
+    }
+
+    /// An empty request id is an absence, not an identity. Two such entries
+    /// are two requests and must both survive — deduplicating on the empty
+    /// string would silently collapse every one of them into one.
+    #[test]
+    fn entries_without_a_request_id_are_each_kept() {
+        let mut inner = AnalyticsInner::default();
+        inner.accumulate(vec![entry("", 10), entry("", 20)]);
+
+        assert_eq!(inner.entries.len(), 2);
+        assert_eq!(analytics::summarize(&inner.entries).total_tokens, 30);
+    }
 }
