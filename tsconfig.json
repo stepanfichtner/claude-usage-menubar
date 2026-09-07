@@ -1,0 +1,12 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "es2023",
+    "types": ["svelte", "vite/client", "node"],
+    "allowJs": true,
+    "checkJs": true,
+    "moduleDetection": "force",
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "vite.config.ts"]
+}
