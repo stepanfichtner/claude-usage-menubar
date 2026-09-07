@@ -119,7 +119,7 @@
   label.check { gap: 8px; }
   input[type="number"] { width: 72px; }
   fieldset {
-    border: 1px solid var(--hairline);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 8px 12px;
     max-height: 150px;

@@ -19,26 +19,39 @@
   </div>
   <div class="meta">
     {#if quota.resetsAt}
-      {formatResetTime(quota.resetsAt)} · in {formatLong(quota.resetsAt, now)}
+      <span>{formatResetTime(quota.resetsAt)}</span>
+      <span>{formatLong(quota.resetsAt, now)} left</span>
     {:else}
-      —
+      <span>—</span>
     {/if}
   </div>
 </div>
 
 <style>
-  .card { padding: 10px 14px; border-radius: 8px; }
-  .card.active { background: var(--active-glow); }
+  .card {
+    padding: 12px 14px;
+    margin: 0 8px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .card.active { border-color: var(--fg-muted); }
   .row { display: flex; justify-content: space-between; align-items: baseline; }
-  .label { font-weight: 500; }
-  .pct { font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; }
+  .label { font-weight: 500; color: var(--fg); }
+  .pct { font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; color: var(--fg); }
   .track {
     height: 6px;
-    margin: 7px 0 5px;
-    border-radius: 3px;
+    margin: 9px 0 7px;
+    border-radius: 999px;
     background: var(--track);
     overflow: hidden;
   }
-  .fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
-  .meta { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+  .fill { height: 100%; border-radius: 999px; transition: width 0.4s ease; }
+  .meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
+  }
 </style>

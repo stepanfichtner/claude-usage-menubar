@@ -1,4 +1,4 @@
-export type Severity = "normal" | "warning" | "critical";
+export type Severity = "normal" | "warning" | "high" | "critical";
 
 export interface Quota {
   id: string;

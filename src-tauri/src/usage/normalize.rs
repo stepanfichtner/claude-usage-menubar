@@ -15,8 +15,8 @@ pub fn normalize(raw: &RawUsage) -> Vec<Quota> {
 
 fn from_limit(limit: &RawLimit) -> Quota {
     let (id, label) = match limit.kind.as_str() {
-        "session" => ("session".to_string(), "Session (5h)".to_string()),
-        "weekly_all" => ("weekly_all".to_string(), "Week · all models".to_string()),
+        "session" => ("session".to_string(), "Current session".to_string()),
+        "weekly_all" => ("weekly_all".to_string(), "This week".to_string()),
         "weekly_scoped" => {
             let model = limit
                 .scope
@@ -24,7 +24,7 @@ fn from_limit(limit: &RawLimit) -> Quota {
                 .and_then(|s| s.model.as_ref())
                 .and_then(|m| m.display_name.as_deref())
                 .unwrap_or("scoped");
-            (format!("weekly:{model}"), format!("Week · {model}"))
+            (format!("weekly:{model}"), format!("{model} this week"))
         }
         other => (other.to_string(), title_case(other)),
     };
@@ -56,13 +56,13 @@ fn legacy(raw: &RawUsage) -> Vec<Quota> {
             }
         }
     };
-    push(&raw.five_hour, "session", "Session (5h)", true);
-    push(&raw.seven_day, "weekly_all", "Week · all models", false);
-    push(&raw.seven_day_opus, "weekly:Opus", "Week · Opus", false);
+    push(&raw.five_hour, "session", "Current session", true);
+    push(&raw.seven_day, "weekly_all", "This week", false);
+    push(&raw.seven_day_opus, "weekly:Opus", "Opus this week", false);
     push(
         &raw.seven_day_sonnet,
         "weekly:Sonnet",
-        "Week · Sonnet",
+        "Sonnet this week",
         false,
     );
     out
@@ -107,15 +107,15 @@ mod tests {
     fn scoped_weekly_uses_the_server_display_name() {
         let quotas = normalize(&load("usage_full.json"));
         assert_eq!(quotas[2].id, "weekly:Fable");
-        assert_eq!(quotas[2].label, "Week · Fable");
+        assert_eq!(quotas[2].label, "Fable this week");
         assert_eq!(quotas[2].resets_at, None);
     }
 
     #[test]
     fn session_and_weekly_all_get_fixed_labels() {
         let quotas = normalize(&load("usage_full.json"));
-        assert_eq!(quotas[0].label, "Session (5h)");
-        assert_eq!(quotas[1].label, "Week · all models");
+        assert_eq!(quotas[0].label, "Current session");
+        assert_eq!(quotas[1].label, "This week");
         assert!(quotas[0].is_active);
         assert!(!quotas[1].is_active);
     }
@@ -180,7 +180,9 @@ mod tests {
     fn derived_severity_boundaries() {
         assert_eq!(Severity::from_percent(49.9), Severity::Normal);
         assert_eq!(Severity::from_percent(50.0), Severity::Warning);
-        assert_eq!(Severity::from_percent(89.9), Severity::Warning);
+        assert_eq!(Severity::from_percent(79.9), Severity::Warning);
+        assert_eq!(Severity::from_percent(80.0), Severity::High);
+        assert_eq!(Severity::from_percent(89.9), Severity::High);
         assert_eq!(Severity::from_percent(90.0), Severity::Critical);
     }
 

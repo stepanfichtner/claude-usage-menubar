@@ -29,7 +29,7 @@ impl TitleEntry {
     }
 }
 
-/// Menu bar form: one unit only. `47m`, `3h`, `6d`.
+/// Menu bar: `49m`, `1h49m`, `6d13h`.
 pub fn format_compact(until: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let minutes = (until - now).num_minutes();
     if minutes <= 0 {
@@ -37,9 +37,9 @@ pub fn format_compact(until: DateTime<Utc>, now: DateTime<Utc>) -> String {
     } else if minutes < 60 {
         format!("{minutes}m")
     } else if minutes < 24 * 60 {
-        format!("{}h", minutes / 60)
+        format!("{}h{}m", minutes / 60, minutes % 60)
     } else {
-        format!("{}d", minutes / (24 * 60))
+        format!("{}d{}h", minutes / (24 * 60), (minutes % (24 * 60)) / 60)
     }
 }
 
@@ -105,6 +105,7 @@ pub enum IconKind {
     Neutral,
     Normal,
     Warning,
+    High,
     Critical,
 }
 
@@ -114,6 +115,7 @@ impl IconKind {
             None => IconKind::Neutral,
             Some(Severity::Normal) => IconKind::Normal,
             Some(Severity::Warning) => IconKind::Warning,
+            Some(Severity::High) => IconKind::High,
             Some(Severity::Critical) => IconKind::Critical,
         }
     }
@@ -123,6 +125,7 @@ impl IconKind {
             IconKind::Neutral => include_bytes!("../icons/tray-neutral.png"),
             IconKind::Normal => include_bytes!("../icons/tray-normal.png"),
             IconKind::Warning => include_bytes!("../icons/tray-warning.png"),
+            IconKind::High => include_bytes!("../icons/tray-high.png"),
             IconKind::Critical => include_bytes!("../icons/tray-critical.png"),
         }
     }
@@ -323,31 +326,45 @@ mod tests {
         );
         assert_eq!(
             format_compact(now() + chrono::Duration::minutes(60), now()),
-            "1h"
+            "1h0m"
+        );
+    }
+
+    /// The exact complaint that prompted this change: 1h49m was rounding down
+    /// to 2h in the menu bar, throwing away the minutes at the point they
+    /// matter most.
+    #[test]
+    fn compact_countdown_keeps_the_smaller_unit_instead_of_rounding() {
+        assert_eq!(
+            format_compact(now() + chrono::Duration::minutes(109), now()),
+            "1h49m"
         );
     }
 
     #[test]
-    fn compact_countdown_uses_whole_hours_under_a_day() {
+    fn compact_countdown_uses_hours_and_minutes_under_a_day() {
         assert_eq!(
             format_compact(now() + chrono::Duration::minutes(238), now()),
-            "3h"
+            "3h58m"
         );
         assert_eq!(
             format_compact(now() + chrono::Duration::hours(23), now()),
-            "23h"
+            "23h0m"
         );
     }
 
     #[test]
-    fn compact_countdown_uses_whole_days_beyond_that() {
+    fn compact_countdown_uses_days_and_hours_beyond_that() {
         assert_eq!(
             format_compact(now() + chrono::Duration::hours(24), now()),
-            "1d"
+            "1d0h"
         );
         assert_eq!(
-            format_compact(now() + chrono::Duration::days(6), now()),
-            "6d"
+            format_compact(
+                now() + chrono::Duration::days(6) + chrono::Duration::hours(13),
+                now()
+            ),
+            "6d13h"
         );
     }
 
@@ -386,7 +403,7 @@ mod tests {
         ];
         assert_eq!(
             render_title(&quotas, &TitleEntry::defaults(), now()),
-            "20% · 3h  2% · 6d"
+            "20% · 3h58m  2% · 6d0h"
         );
     }
 
@@ -406,7 +423,7 @@ mod tests {
         let quotas = vec![quota("session", 20.0, 238)];
         assert_eq!(
             render_title(&quotas, &TitleEntry::defaults(), now()),
-            "20% · 3h"
+            "20% · 3h58m"
         );
     }
 
@@ -463,6 +480,28 @@ mod tests {
         assert_eq!(
             IconKind::for_quotas(&[quota("a", 10.0, 60)]),
             IconKind::Normal
+        );
+    }
+
+    #[test]
+    fn the_icon_maps_high_severity_to_the_high_icon() {
+        assert_eq!(
+            IconKind::for_quotas(&[quota("a", 85.0, 60)]),
+            IconKind::High
+        );
+    }
+
+    #[test]
+    fn the_icon_orders_high_between_warning_and_critical() {
+        // High must outrank Warning...
+        assert_eq!(
+            IconKind::for_quotas(&[quota("a", 60.0, 60), quota("b", 85.0, 60)]),
+            IconKind::High
+        );
+        // ...and Critical must still outrank High.
+        assert_eq!(
+            IconKind::for_quotas(&[quota("a", 85.0, 60), quota("b", 95.0, 60)]),
+            IconKind::Critical
         );
     }
 

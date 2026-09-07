@@ -6,15 +6,19 @@ use serde::{Deserialize, Serialize};
 pub enum Severity {
     Normal,
     Warning,
+    High,
     Critical,
 }
 
 impl Severity {
-    /// Locally derived severity. Boundaries match the default notification
-    /// thresholds so the colour change and the notification agree (spec §6.2).
+    /// Locally derived severity. Boundaries match the notification thresholds
+    /// exactly, so a banner and a colour change always arrive together (spec
+    /// §6.2).
     pub fn from_percent(percent: f64) -> Self {
         if percent >= 90.0 {
             Severity::Critical
+        } else if percent >= 80.0 {
+            Severity::High
         } else if percent >= 50.0 {
             Severity::Warning
         } else {
@@ -23,7 +27,8 @@ impl Severity {
     }
 
     /// The server's own severity. Anything unrecognised is treated as normal
-    /// rather than rejected, so a new value cannot break the app.
+    /// rather than rejected, so a new value cannot break the app. There is no
+    /// server value for `High` — it only ever arrives via `from_percent`.
     pub fn from_api(value: Option<&str>) -> Self {
         match value {
             Some("warning") => Severity::Warning,
