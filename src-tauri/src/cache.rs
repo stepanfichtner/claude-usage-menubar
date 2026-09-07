@@ -91,6 +91,22 @@ mod tests {
         assert!(load_snapshot(dir.path()).is_none());
     }
 
+    /// The stored timestamp is bracketed between two readings of the same
+    /// clock rather than measured against a fixed tolerance. The previous
+    /// version allowed five seconds of slack, which was both flaky and loose:
+    /// a CI box that stalled between `save_profile` and the assertion failed
+    /// it, while a `save_profile` that wrote a timestamp four seconds stale
+    /// passed it.
+    ///
+    /// There is no clock seam on this path — `save_profile` reads `Utc::now()`
+    /// itself — and cutting one is not worth it for a value only ever compared
+    /// against `PROFILE_MAX_AGE_HOURS`. Bracketing does not need a seam:
+    /// whatever the wall clock says and however long the machine takes over
+    /// the call, the reading taken inside `save_profile` lies between the one
+    /// taken before it and the one taken after. That makes this both
+    /// unflakeable and tighter than the tolerance it replaces — it fails on a
+    /// timestamp that is stale by any amount at all, or on a `load_profile`
+    /// that returns a re-read clock instead of the stored value.
     #[test]
     fn round_trips_a_profile_with_its_timestamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -98,16 +114,43 @@ mod tests {
             display_name: "Fichy".into(),
             plan_label: "Claude Max 5×".into(),
         };
+
+        let before = Utc::now();
         save_profile(dir.path(), &profile).unwrap();
-        let (loaded, at) = load_profile(dir.path()).unwrap();
+        let (loaded, stored_at) = load_profile(dir.path()).unwrap();
+        let after = Utc::now();
+
         assert_eq!(loaded, profile);
-        assert!(Utc::now().signed_duration_since(at).num_seconds() < 5);
+        assert!(
+            (before..=after).contains(&stored_at),
+            "stored_at {stored_at} falls outside [{before}, {after}], so it is \
+             not the reading save_profile took"
+        );
     }
 
-    /// Spec §12.3: the cached profile must not contain personal data beyond the
-    /// display name we deliberately show.
+    /// Spec §12.3: nothing personal beyond the display name may reach the
+    /// disk.
+    ///
+    /// This replaces `the_cached_profile_contains_no_email_or_full_name`,
+    /// which hand-built a two-field `Profile` and asserted the JSON held no
+    /// `@`. Nothing could have made that fail. `Profile` has exactly two
+    /// `String` fields and the test supplied both, so the assertion was about
+    /// its own literals: a `Profile` that grew an `email` would have passed it
+    /// unchanged for as long as the test kept using the old constructor, and a
+    /// field named `accountName` would have passed it however it was built.
+    ///
+    /// What is worth guarding is the shape of the file, so that is what this
+    /// asserts — `stored_at` plus a profile object holding exactly
+    /// `displayName` and `planLabel`. `profile.rs`'s
+    /// `reads_only_display_name_and_tier` guards the other end, what may be
+    /// deserialized out of the API response, so a new personal field has to
+    /// get past two tests to land on disk.
+    ///
+    /// It fails on *any* added field, harmless ones included. That is the
+    /// point: the question it forces is "does this belong on disk", and the
+    /// cost of answering it is one line here.
     #[test]
-    fn the_cached_profile_contains_no_email_or_full_name() {
+    fn the_cached_profile_holds_only_the_two_fields_it_is_allowed_to() {
         let dir = tempfile::tempdir().unwrap();
         save_profile(
             dir.path(),
@@ -117,11 +160,30 @@ mod tests {
             },
         )
         .unwrap();
+
         let text = std::fs::read_to_string(dir.path().join("profile.json")).unwrap();
-        assert!(
-            !text.contains('@'),
-            "cache looks like it holds an email: {text}"
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let mut wrapper: Vec<&str> = value
+            .as_object()
+            .expect("the cache file is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        wrapper.sort_unstable();
+        assert_eq!(wrapper, ["profile", "stored_at"]);
+
+        let mut fields: Vec<&str> = value["profile"]
+            .as_object()
+            .expect("the profile is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["displayName", "planLabel"],
+            "a new field reached the cache file: {text}"
         );
-        assert!(!text.contains("fullName"));
     }
 }
