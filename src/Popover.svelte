@@ -7,9 +7,20 @@
   import Ring from "./lib/Ring.svelte";
   import QuotaCard from "./lib/QuotaCard.svelte";
   import { formatCompact } from "./lib/countdown";
+  import { ageIsStale, formatAge, secondsSince } from "./lib/freshness";
+  import { PANEL_WIDTH, nextPanelHeight, splitQuotas } from "./lib/panel";
   import { now, snapshot } from "./lib/stores";
 
-  const STALE_WARNING_SECS = 5 * 60;
+  // Everything here that can be decided without a webview lives in
+  // `./lib/panel` and `./lib/freshness`, where the vitest suite reaches it:
+  // the window's resize arithmetic, the quota split, and the footer's age and
+  // staleness. What is left in this file needs a real Tauri window or a real
+  // render — the `app_version` round trip, `getCurrentWindow()`, the refresh
+  // acknowledgement timer, the `hasLiveSnapshot` latch, `fetchedAtLabel`'s
+  // locale formatting, and the `{#if}` chains in the markup below. None of
+  // that is covered by tests: this repo has no component-rendering harness,
+  // and a jsdom render would not be the environment this panel actually runs
+  // in anyway.
 
   // Read once at startup from Cargo.toml's version via the `app_version`
   // command. Empty until it resolves, and the footer simply omits it in that
@@ -18,16 +29,6 @@
   invoke<string>("app_version")
     .then((v) => (version = v))
     .catch(() => {});
-
-  // The window's fixed width, matching `tauri.conf.json`'s popover window —
-  // only the height ever changes. Bounds are a sane floor/ceiling so a
-  // pathological snapshot (zero quotas, or fifty of them) can't produce an
-  // unusably short or absurdly tall window; ordinary quota counts (1-6ish)
-  // land well inside this range, and `overflow-y: auto` on `main` below is
-  // the fallback if a real one ever doesn't.
-  const PANEL_WIDTH = 320;
-  const MIN_HEIGHT = 140;
-  const MAX_HEIGHT = 720;
 
   // Outside a real Tauri webview — this component mounted in a plain browser
   // for headless verification, say — `getCurrentWindow()` throws
@@ -60,13 +61,10 @@
     }
   }
 
-  // The last height actually requested from the OS window. On a transparent
-  // window with `backdrop-filter`, every `setSize` call re-composites the
-  // backdrop even when the new size equals the old one — calling it on every
-  // snapshot (most of which don't change the content's height) made the
-  // panel visibly flash between blurred and clear about once a poll. `0` is
-  // not a height any real snapshot produces (`MIN_HEIGHT` floors it), so the
-  // first resize is never skipped.
+  // The last height actually requested from the OS window; `nextPanelHeight`
+  // answers `null` when it hasn't changed, and explains why that matters. `0`
+  // is the "nothing requested yet" sentinel and is not a height any real
+  // snapshot produces, so the first resize is never skipped.
   let lastHeight = 0;
 
   // `stale` means "no live fetch has succeeded since launch" — true only for
@@ -79,26 +77,8 @@
     if ($snapshot && !$snapshot.snapshot.stale) hasLiveSnapshot = true;
   });
 
-  const ageSeconds = $derived.by(() => {
-    const fetchedAt = $snapshot?.snapshot.fetchedAt;
-    if (!fetchedAt) return 0;
-    return Math.max(0, Math.floor(($now.getTime() - new Date(fetchedAt).getTime()) / 1000));
-  });
-
-  // Elapsed time, computed directly. Reusing formatLong here would be wrong:
-  // it answers "how long until this timestamp", and for one already in the past
-  // it returns "now" — rendering "updated now ago".
-  const age = $derived.by(() => {
-    const seconds = ageSeconds;
-    // "updated 0s ago" is what a refresh that just landed used to say. The
-    // number is accurate and reads as broken, so the first ten seconds get
-    // words instead.
-    if (seconds < 10) return "updated just now";
-    if (seconds < 60) return `updated ${seconds}s ago`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `updated ${minutes}m ago`;
-    return `updated ${Math.floor(minutes / 60)}h ago`;
-  });
+  const ageSeconds = $derived(secondsSince($snapshot?.snapshot.fetchedAt, $now));
+  const age = $derived(formatAge(ageSeconds));
 
   // The exact timestamp, on hover. The relative age answers "is this current?"
   // at a glance; this answers "current as of when?" without spending a line of
@@ -114,16 +94,11 @@
   // touches `stale` at all, so it never lands here — the footer just keeps
   // counting up the age of the last good snapshot instead.
   const showingCachedData = $derived(!hasLiveSnapshot && ($snapshot?.snapshot.stale ?? false));
-  const footerIsWarning = $derived(ageSeconds > STALE_WARNING_SECS);
+  const footerIsWarning = $derived(ageIsStale(ageSeconds));
 
-  // The session quota gets the full-width meter; everything else — any
-  // number of weekly windows, present or future — goes in the ring grid.
-  // Never hard-code which quotas exist: a new model's weekly window must
-  // appear here with no code change, which is the whole point of consuming
-  // `limits[]` in the first place.
-  const quotas = $derived($snapshot?.snapshot.quotas ?? []);
-  const session = $derived(quotas.find((q) => q.id === "session") ?? null);
-  const rings = $derived(quotas.filter((q) => q.id !== "session"));
+  const layout = $derived(splitQuotas($snapshot?.snapshot.quotas ?? []));
+  const session = $derived(layout.session);
+  const rings = $derived(layout.rings);
 
   // The quota count comes from the server (`limits[]`), so a fixed window
   // height either wastes space (one quota) or clips the session card and
@@ -147,11 +122,8 @@
     if (!tauriWindow) return;
     requestAnimationFrame(() => {
       if (!mainEl) return;
-      const height = Math.min(
-        MAX_HEIGHT,
-        Math.max(MIN_HEIGHT, Math.ceil(mainEl.scrollHeight)),
-      );
-      if (height === lastHeight) return;
+      const height = nextPanelHeight(mainEl.scrollHeight, lastHeight);
+      if (height === null) return;
       lastHeight = height;
       tauriWindow!.setSize(new LogicalSize(PANEL_WIDTH, height)).catch(() => {});
     });
