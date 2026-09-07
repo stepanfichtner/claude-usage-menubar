@@ -17,8 +17,10 @@ describe("nextThreshold", () => {
     expect(nextThreshold(thresholds)).toBe(expected);
   });
 
+  // `[50, 80, 90]` would yield 100 with or without `Math.min`, so the cap
+  // needs a highest whose step actually overshoots it.
   it("caps the step at 100", () => {
-    expect(nextThreshold([50, 80, 90])).toBe(100);
+    expect(nextThreshold([95])).toBe(100);
   });
 
   // The bug: `Math.min(100, highest + 10)` returned 100 again, so the UI
