@@ -5,11 +5,13 @@ use chrono::{DateTime, Utc};
 use crate::error::ApiError;
 use crate::model::Quota;
 
-const BACKOFF_STEPS: [u64; 3] = [5 * 60, 15 * 60, 30 * 60];
+const BACKOFF_STEPS: [u64; 3] = [2 * 60, 5 * 60, 15 * 60];
 
-/// Spec §7: a manual refresh — the menu item, the popover's button, or the
-/// popover simply being opened — is allowed at most once every 20 seconds.
-pub const MIN_MANUAL_REFRESH_SECS: i64 = 20;
+/// Spec §7. The limit is burst-sensitive rather than rate-sensitive — three
+/// requests four seconds apart pass, four inside ten seconds do not — so this
+/// exists to stop a burst forming. Twenty seconds was short enough to let one
+/// form from panel opens alone.
+pub const MIN_MANUAL_REFRESH_SECS: i64 = 60;
 
 #[derive(Debug, Default)]
 pub struct RefreshThrottle {
@@ -23,7 +25,7 @@ impl RefreshThrottle {
 
     /// Returns whether the request is let through, recording it if so. A refused
     /// request does not push the window out, so a burst of clicks still lets one
-    /// refresh through every 20 seconds rather than none.
+    /// refresh through every `MIN_MANUAL_REFRESH_SECS` seconds rather than none.
     pub fn allow(&mut self, now: DateTime<Utc>) -> bool {
         let allowed = match self.last {
             None => true,
@@ -144,7 +146,7 @@ pub struct SnapshotEvent {
 }
 
 /// Signals an out-of-band refresh (menu item, refresh button, popover opening),
-/// gated by the 20-second throttle above.
+/// gated by the `MIN_MANUAL_REFRESH_SECS` throttle above.
 #[derive(Default)]
 pub struct RefreshSignal {
     notify: Notify,
@@ -303,16 +305,16 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiting_escalates_5_15_30_and_caps() {
+    fn rate_limiting_escalates_2_5_15_and_caps() {
         let mut backoff = Backoff::new();
+        backoff.on_rate_limited();
+        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(2 * 60));
         backoff.on_rate_limited();
         assert_eq!(backoff.next_delay(BASE), Duration::from_secs(5 * 60));
         backoff.on_rate_limited();
         assert_eq!(backoff.next_delay(BASE), Duration::from_secs(15 * 60));
         backoff.on_rate_limited();
-        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(30 * 60));
-        backoff.on_rate_limited();
-        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(30 * 60));
+        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(15 * 60));
     }
 
     #[test]
@@ -367,7 +369,7 @@ mod tests {
         let mut auth = AuthState::Ok;
         let decision = decide(&Err(ApiError::RateLimited), &mut backoff, &mut auth);
         assert_eq!(decision, Decision::Wait);
-        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(5 * 60));
+        assert_eq!(backoff.next_delay(BASE), Duration::from_secs(2 * 60));
         assert_eq!(auth, AuthState::Ok);
     }
 
@@ -382,26 +384,26 @@ mod tests {
     }
 
     #[test]
-    fn a_second_manual_refresh_within_twenty_seconds_is_refused() {
+    fn a_second_manual_refresh_before_the_throttle_window_elapses_is_refused() {
         let mut throttle = RefreshThrottle::new();
         throttle.allow(at(0));
-        assert!(!throttle.allow(at(19)));
+        assert!(!throttle.allow(at(MIN_MANUAL_REFRESH_SECS - 1)));
     }
 
     #[test]
-    fn a_manual_refresh_after_twenty_seconds_is_allowed() {
+    fn a_manual_refresh_after_the_throttle_window_elapses_is_allowed() {
         let mut throttle = RefreshThrottle::new();
         throttle.allow(at(0));
-        assert!(throttle.allow(at(20)));
+        assert!(throttle.allow(at(MIN_MANUAL_REFRESH_SECS)));
     }
 
     #[test]
     fn a_refused_refresh_does_not_extend_the_window() {
         let mut throttle = RefreshThrottle::new();
         throttle.allow(at(0));
-        assert!(!throttle.allow(at(10)));
+        assert!(!throttle.allow(at(MIN_MANUAL_REFRESH_SECS / 2)));
         assert!(
-            throttle.allow(at(20)),
+            throttle.allow(at(MIN_MANUAL_REFRESH_SECS)),
             "the refusal must not reset the clock"
         );
     }

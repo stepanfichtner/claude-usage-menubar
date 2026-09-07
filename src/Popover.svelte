@@ -35,6 +35,32 @@
 
   let mainEl: HTMLElement | undefined = $state();
 
+  // Acknowledges the click, nothing more. A throttled or rate-limited
+  // refresh emits no snapshot event at all (poller.rs's `Decision::Wait`
+  // path), so waiting for "the next snapshot" to clear this would leave the
+  // icon spinning forever on exactly the refreshes most worth acknowledging.
+  // Stopping on a fixed timer instead means the acknowledgement never
+  // depends on something that may never happen.
+  let refreshing = $state(false);
+
+  async function refresh() {
+    refreshing = true;
+    try {
+      await invoke("refresh_now");
+    } finally {
+      setTimeout(() => (refreshing = false), 1000);
+    }
+  }
+
+  // The last height actually requested from the OS window. On a transparent
+  // window with `backdrop-filter`, every `setSize` call re-composites the
+  // backdrop even when the new size equals the old one — calling it on every
+  // snapshot (most of which don't change the content's height) made the
+  // panel visibly flash between blurred and clear about once a poll. `0` is
+  // not a height any real snapshot produces (`MIN_HEIGHT` floors it), so the
+  // first resize is never skipped.
+  let lastHeight = 0;
+
   // `stale` means "no live fetch has succeeded since launch" — true only for
   // the cached snapshot served at cold start, before the first live poll
   // lands. Once a live (non-stale) snapshot has arrived this session, it
@@ -104,6 +130,8 @@
         MAX_HEIGHT,
         Math.max(MIN_HEIGHT, Math.ceil(mainEl.scrollHeight)),
       );
+      if (height === lastHeight) return;
+      lastHeight = height;
       tauriWindow!.setSize(new LogicalSize(PANEL_WIDTH, height)).catch(() => {});
     });
   });
@@ -117,7 +145,7 @@
         <div class="plan">{$snapshot.profile.planLabel}</div>
       {/if}
     </div>
-    <button title="Refresh now" onclick={() => invoke("refresh_now")}>
+    <button class="icon-button" class:busy={refreshing} title="Refresh now" onclick={refresh}>
       <RefreshCw size={16} />
     </button>
     <button title="Settings" onclick={() => invoke("open_settings")}>
@@ -192,6 +220,11 @@
     border-radius: 5px;
   }
   button:hover { color: var(--fg); background: var(--hover); }
+  .icon-button.busy :global(svg) { animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .icon-button.busy :global(svg) { animation: none; opacity: 0.5; }
+  }
   .empty { padding: 24px 14px; text-align: center; color: var(--fg-muted); }
 
   .rings {

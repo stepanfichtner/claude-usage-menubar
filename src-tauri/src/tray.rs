@@ -365,7 +365,7 @@ fn toggle_popover(app: &AppHandle) {
         }
         let _ = window.show();
         let _ = window.set_focus();
-        // Spec §7: opening the popover refreshes, under the same 20 s throttle.
+        // Spec §7: opening the popover refreshes, under the same manual-refresh throttle.
         if let Some(signal) = app.try_state::<std::sync::Arc<crate::poller::RefreshSignal>>() {
             signal.request();
         }
