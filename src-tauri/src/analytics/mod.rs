@@ -103,7 +103,11 @@ fn tokens_of(entry: &scan::Entry) -> u64 {
 /// two buckets with equal cost and equal tokens would otherwise swap places
 /// between calls and the list would reshuffle under the user every poll.
 fn bucket(groups: HashMap<String, Totals>) -> Vec<Bucket> {
-    let mut buckets: Vec<Bucket> = groups.into_iter().map(into_bucket).collect();
+    let mut buckets: Vec<Bucket> = groups
+        .into_iter()
+        .filter(spent_something)
+        .map(into_bucket)
+        .collect();
     buckets.sort_by(|a, b| {
         b.cost
             .partial_cmp(&a.cost)
@@ -112,6 +116,17 @@ fn bucket(groups: HashMap<String, Totals>) -> Vec<Bucket> {
             .then_with(|| a.name.cmp(&b.name))
     });
     buckets
+}
+
+/// A bucket that spent no tokens says nothing and is not rendered.
+///
+/// Real transcripts produce these: `<synthetic>` is what Claude Code records
+/// as the model on its own synthesised assistant turns, and those report zero
+/// of every token class. Kept, such a row would appear in the model list as
+/// "0 tokens — not priced", drawing the eye to a warning about nothing, since
+/// no price is missing from an estimate when nothing was spent.
+fn spent_something((_, totals): &(String, Totals)) -> bool {
+    totals.tokens > 0
 }
 
 fn into_bucket((name, totals): (String, Totals)) -> Bucket {
@@ -151,7 +166,11 @@ pub fn summarize(entries: &[scan::Entry]) -> Summary {
     // Days read as a timeline, so they sort by date rather than by cost. The
     // key is `%Y-%m-%d`, which is fixed-width and zero-padded, so a reverse
     // string sort is a reverse date sort.
-    let mut days: Vec<Bucket> = by_day.into_iter().map(into_bucket).collect();
+    let mut days: Vec<Bucket> = by_day
+        .into_iter()
+        .filter(spent_something)
+        .map(into_bucket)
+        .collect();
     days.sort_by(|a, b| b.name.cmp(&a.name));
 
     Summary {
@@ -384,5 +403,46 @@ mod tests {
                 "Bucket is missing {key}"
             );
         }
+    }
+
+    /// Claude Code records `<synthetic>` as the model on its own synthesised
+    /// assistant turns, and those report zero of every token class — so this
+    /// is a shape real transcripts produce, not a contrived one. Such a bucket
+    /// would render as "0 tokens — not priced", which points a warning at
+    /// something that took nothing out of the estimate.
+    ///
+    /// The entry's tokens still reach the totals, because there are none of
+    /// them; what is dropped is the empty row, not the arithmetic.
+    #[test]
+    fn a_bucket_that_spent_nothing_is_not_listed() {
+        let summary = summarize(&[
+            entry("claude-opus-5", "alpha", 1_000_000, 0),
+            entry("<synthetic>", "alpha", 0, 0),
+        ]);
+
+        assert_eq!(
+            summary.by_model.len(),
+            1,
+            "{:?}",
+            summary.by_model.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        assert_eq!(summary.by_model[0].name, "claude-opus-5");
+        assert_eq!(summary.total_tokens, 1_000_000);
+        assert_eq!(
+            summary.unpriced_tokens, 0,
+            "a model that spent nothing withholds nothing from the estimate"
+        );
+    }
+
+    /// The other side of it: a project whose only entry is unpriced but which
+    /// did spend tokens must still be listed, or the tab would drop the very
+    /// rows the unpriced warning is about.
+    #[test]
+    fn a_bucket_that_spent_unpriced_tokens_is_still_listed() {
+        let summary = summarize(&[entry("some-future-model", "alpha", 2_000_000, 0)]);
+        assert_eq!(summary.by_model.len(), 1);
+        assert_eq!(summary.by_project.len(), 1);
+        assert_eq!(summary.by_day.len(), 1);
+        assert_eq!(summary.unpriced_tokens, 2_000_000);
     }
 }
