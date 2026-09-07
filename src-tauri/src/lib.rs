@@ -102,6 +102,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(poller::RefreshSignal::default()))
         .manage(Arc::new(updater::UpdateCheckStatus::default()))
+        .manage(Arc::new(tray::LastQuotaLines::default()))
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.handle()

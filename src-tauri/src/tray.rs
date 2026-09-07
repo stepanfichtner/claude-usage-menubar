@@ -261,6 +261,37 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, labels: &[String]) -> tauri::Resul
     Ok(menu)
 }
 
+/// The most recently rendered quota lines — `menu_labels(&snapshot.quotas,
+/// now)` — held so a menu rebuild triggered without a fresh `UsageSnapshot`
+/// (an update check starting or finishing; see `refresh_menu`) can still
+/// show them, rather than blanking the top of the menu. Empty before the
+/// first poll, which is exactly what the menu already looks like at launch
+/// — not a hazard to guard against, just the normal startup state.
+#[derive(Default)]
+pub struct LastQuotaLines(std::sync::Mutex<Vec<String>>);
+
+impl LastQuotaLines {
+    fn set(&self, lines: Vec<String>) {
+        *self.0.lock().unwrap() = lines;
+    }
+
+    fn get(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The quota lines to render right now: the last ones `apply` stored, or an
+/// empty list if none have been stored yet (no snapshot has arrived, or the
+/// state was never managed — same result either way, and neither is an
+/// error). Split out from `refresh_menu` so it can be tested without
+/// touching `muda`: reading managed state needs no main-thread dispatch,
+/// unlike constructing a `Menu`.
+fn current_quota_lines<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
+    app.try_state::<std::sync::Arc<LastQuotaLines>>()
+        .map(|lines| lines.get())
+        .unwrap_or_default()
+}
+
 /// Push a fresh snapshot into the tray: icon, title, and menu rows.
 pub fn apply(app: &AppHandle, snapshot: &UsageSnapshot) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -275,7 +306,27 @@ pub fn apply(app: &AppHandle, snapshot: &UsageSnapshot) {
     }
     let entries = crate::settings::load(app).title_entries;
     let _ = tray.set_title(Some(render_title(&snapshot.quotas, &entries, now)));
-    if let Ok(menu) = build_menu(app, &menu_labels(&snapshot.quotas, now)) {
+    let labels = menu_labels(&snapshot.quotas, now);
+    if let Some(lines) = app.try_state::<std::sync::Arc<LastQuotaLines>>() {
+        lines.set(labels.clone());
+    }
+    if let Ok(menu) = build_menu(app, &labels) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+/// Rebuilds the menu from the last rendered quota lines, without needing a
+/// fresh `UsageSnapshot`. Used when the update-check status changes, so the
+/// outcome appears the moment it changes rather than waiting for the
+/// poller's next cycle to rebuild the menu incidentally. The update-check
+/// label itself is read fresh inside `build_menu`, same as any other
+/// rebuild.
+pub fn refresh_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let labels = current_quota_lines(app);
+    if let Ok(menu) = build_menu(app, &labels) {
         let _ = tray.set_menu(Some(menu));
     }
 }
@@ -643,6 +694,65 @@ mod tests {
     #[test]
     fn the_check_updates_row_carries_whatever_label_it_is_given() {
         let items: Vec<(&str, String, bool)> = trailing_rows("Checking for updates…".to_string())
+            .into_iter()
+            .filter_map(|row| match row {
+                MenuRow::Item { id, label, enabled } => Some((id, label, enabled)),
+                MenuRow::Separator => None,
+            })
+            .collect();
+        let (_, check_label, _) = items
+            .iter()
+            .find(|(id, _, _)| *id == "check_updates")
+            .expect("Check for Updates… item missing");
+        assert_eq!(*check_label, "Checking for updates…");
+    }
+
+    /// Before the first poll (or if the state was somehow never managed),
+    /// there is nothing to show at the top of the menu — that must resolve
+    /// to an empty list, not an error, exactly as it already does today at
+    /// launch, before `apply` has run even once.
+    #[test]
+    fn no_stored_lines_yields_an_empty_list_rather_than_an_error() {
+        let app = tauri::test::mock_builder()
+            .manage(std::sync::Arc::new(LastQuotaLines::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        assert_eq!(current_quota_lines(app.handle()), Vec::<String>::new());
+    }
+
+    /// R52's actual point: a rebuild triggered by an update check — which
+    /// has no `UsageSnapshot` of its own — must still show whatever quota
+    /// lines the last poll rendered, read twice here to simulate the
+    /// `set_checking` and `set_done` rebuilds both happening between polls.
+    #[test]
+    fn stored_lines_are_returned_without_needing_a_fresh_poll() {
+        let app = tauri::test::mock_builder()
+            .manage(std::sync::Arc::new(LastQuotaLines::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        let lines = app.handle().state::<std::sync::Arc<LastQuotaLines>>();
+        lines.set(vec!["Label session — 20% · in 3h 58m".to_string()]);
+
+        assert_eq!(
+            current_quota_lines(app.handle()),
+            vec!["Label session — 20% · in 3h 58m".to_string()]
+        );
+        // Read again without anything having polled in between.
+        assert_eq!(
+            current_quota_lines(app.handle()),
+            vec!["Label session — 20% · in 3h 58m".to_string()]
+        );
+    }
+
+    /// The other half of R52: a status change must reach `trailing_rows`'
+    /// output on its own, with no poll — and so no `UsageSnapshot`, and no
+    /// call to `apply` — involved anywhere in the chain.
+    #[test]
+    fn a_status_change_reaches_trailing_rows_without_any_poll_having_run() {
+        let status = crate::updater::UpdateCheckStatus::default();
+        status.set_checking();
+
+        let items: Vec<(&str, String, bool)> = trailing_rows(status.label())
             .into_iter()
             .filter_map(|row| match row {
                 MenuRow::Item { id, label, enabled } => Some((id, label, enabled)),

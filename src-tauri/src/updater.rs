@@ -26,10 +26,14 @@
 //!
 //! The channel that actually works is [`UpdateCheckStatus`]: the outcome of
 //! the last check, held in `.manage()`d state and rendered fresh into the
-//! `Check for Updates…` menu label every time `tray::apply` rebuilds the
-//! menu. The user clicked a menu item; the answer belongs in that menu,
-//! where this app controls delivery completely — nothing about it depends
-//! on an OS notification daemon existing.
+//! `Check for Updates…` menu label every time the tray menu is rebuilt. That
+//! rebuild is not left to chance or to the poller's own cadence — `spawn_check`
+//! forces one (`tray::refresh_menu`) the instant the status changes, both when
+//! a check starts and when it finishes, so the label reflects reality within
+//! the same click rather than up to a poll interval later. The user clicked a
+//! menu item; the answer belongs in that menu, on that click, where this app
+//! controls delivery completely — nothing about it depends on an OS
+//! notification daemon existing.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -122,11 +126,15 @@ enum CheckState {
 pub struct UpdateCheckStatus(Mutex<CheckState>);
 
 impl UpdateCheckStatus {
-    fn set_checking(&self) {
+    // `pub(crate)` rather than private: `tray.rs`'s tests drive these
+    // directly to prove a status change reaches `trailing_rows()` output
+    // with no poll involved (R52) — production code only ever calls them
+    // from `spawn_check` below.
+    pub(crate) fn set_checking(&self) {
         *self.0.lock().unwrap() = CheckState::Checking;
     }
 
-    fn set_done(&self, outcome: CheckOutcome) {
+    pub(crate) fn set_done(&self, outcome: CheckOutcome) {
         *self.0.lock().unwrap() = CheckState::Done {
             outcome,
             at: Instant::now(),
@@ -159,17 +167,26 @@ impl UpdateCheckStatus {
 ///
 /// Spawned rather than run inline because `check()` and `download_and_install()`
 /// are async while the menu event handler that calls this is not. The status
-/// is set to `Checking` synchronously, before the async work is scheduled,
-/// so the very next menu rebuild already reflects that a check is running.
+/// is set to `Checking` synchronously, before the async work is scheduled, and
+/// `tray::refresh_menu` is called right after — both here and again once the
+/// outcome is known — because nothing else rebuilds the menu on demand:
+/// `tray::apply` only runs on the poller's own cycle, up to a minute away, and
+/// without this the label would sit unchanged until then. That gap — a
+/// user-initiated action producing nothing visible until an unrelated timer
+/// happens to fire — is exactly the failure mode this module exists to rule
+/// out; deriving the label from state (R51) is necessary but was not
+/// sufficient on its own without also forcing the rebuild that reads it.
 pub fn spawn_check(app: AppHandle) {
     if let Some(status) = app.try_state::<std::sync::Arc<UpdateCheckStatus>>() {
         status.set_checking();
     }
+    crate::tray::refresh_menu(&app);
     tauri::async_runtime::spawn(async move {
         let outcome = run_check(&app).await;
         if let Some(status) = app.try_state::<std::sync::Arc<UpdateCheckStatus>>() {
             status.set_done(outcome.clone());
         }
+        crate::tray::refresh_menu(&app);
         notify(&app, &outcome);
         if let CheckOutcome::Installing { .. } = outcome {
             app.restart();
@@ -177,16 +194,19 @@ pub fn spawn_check(app: AppHandle) {
     });
 }
 
-/// Shows the best-effort system notification for `outcome`, and echoes the
-/// same text onto the tray icon's tooltip as a second, equally best-effort
-/// signal — not a guarantee, since neither call can report whether anything
-/// actually became visible (see the module doc comment). On Linux, the
-/// tooltip echo is itself a documented no-op in the `tray-icon` crate's
+/// Shows a best-effort system notification for `outcome`, and echoes the
+/// same text onto the tray icon's tooltip — both courtesies on top of the
+/// real channel, which is the `Check for Updates…` menu label
+/// (`UpdateCheckStatus`, already rebuilt into the menu via
+/// `tray::refresh_menu` by the time `spawn_check` calls this). Neither call
+/// here can report whether anything actually became visible (see the module
+/// doc comment), so neither is something the user should have to rely on to
+/// learn the outcome. On Linux, the tooltip echo is itself a documented
+/// no-op in the `tray-icon` crate's
 /// GTK/AppIndicator backend (confirmed by reading
 /// `tray-icon-0.24.2/src/platform_impl/gtk/mod.rs`, whose `set_tooltip`
 /// always returns `Ok(())` without doing anything); on macOS it genuinely
-/// sets the native tooltip. Either way, the menu label — not this function
-/// — is what the feature actually depends on.
+/// sets the native tooltip.
 fn notify(app: &AppHandle, outcome: &CheckOutcome) {
     let (title, body) = outcome.notification();
     let _ = app
