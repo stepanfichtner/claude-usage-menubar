@@ -148,7 +148,8 @@ fn profile_is_due(
 
 /// R56: whether this iteration should attempt a profile fetch, composing
 /// this iteration's own usage-poll `result` with the entering `backoff`
-/// state. At the call site, `decide()` has not run yet for this iteration's
+/// state and with whether this iteration is the immediate re-auth retry.
+/// At the call site, `decide()` has not run yet for this iteration's
 /// `result` — only `backoff`'s bookkeeping lags, not the outcome itself,
 /// which is already known. Consulting `backoff.is_backing_off()` alone was
 /// off by one iteration: it missed a rate limit that started on *this* very
@@ -157,9 +158,19 @@ fn profile_is_due(
 fn should_fetch_profile(
     result: &Result<Vec<Quota>, ApiError>,
     backoff: &Backoff,
+    retrying_auth: bool,
     fetched_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
+    // The retry pass: the one `Decision::RetryAuthOnce` sent straight back
+    // round with no wait at all. The re-read of the credential is deliberate and stays;
+    // the profile fetch riding along with it is not — `profile_is_due`
+    // answers "due" on both passes whenever no profile has ever been cached,
+    // so a token that reads but 401s emitted four requests in about a second.
+    // Suppressing it here makes the retry cost one request rather than two.
+    if retrying_auth {
+        return false;
+    }
     let rate_limited_now = matches!(result, Err(ApiError::RateLimited));
     profile_is_due(
         rate_limited_now || backoff.is_backing_off(),
@@ -221,6 +232,7 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         let client = reqwest::Client::new();
         let mut backoff = Backoff::new();
         let mut auth = AuthState::Ok;
+        let mut retrying_auth = false;
         let mut notifier = Notifier::new();
         let cache_dir = app
             .path()
@@ -265,9 +277,18 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
             // would miss a rate limit that started on this very poll, so
             // `should_fetch_profile` consults both: this iteration's own
             // result, and whatever `backoff` was still carrying in from
-            // before it.
-            let stale_profile =
-                should_fetch_profile(&result, &backoff, profile_fetched_at, Utc::now());
+            // before it — and whether this pass is the immediate re-auth
+            // retry, which `Decision::RetryAuthOnce` reaches with no wait in
+            // between. That retry is one deliberate extra usage request; it
+            // must not also drag a profile fetch along, or a token that reads
+            // but 401s emits four requests inside a second.
+            let stale_profile = should_fetch_profile(
+                &result,
+                &backoff,
+                retrying_auth,
+                profile_fetched_at,
+                Utc::now(),
+            );
             if stale_profile {
                 if let Some(token) = &token {
                     if let Ok(fresh) =
@@ -280,7 +301,9 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                 }
             }
 
-            match decide(&result, &mut backoff, &mut auth) {
+            let decision = decide(&result, &mut backoff, &mut auth);
+            retrying_auth = decision == Decision::RetryAuthOnce;
+            match decision {
                 Decision::RetryAuthOnce => continue,
                 Decision::Publish => {
                     let quotas = result.unwrap_or_default();
@@ -504,7 +527,13 @@ mod tests {
         fn not_due_when_this_very_poll_is_rate_limited_even_with_a_fresh_backoff() {
             let result: Result<Vec<Quota>, ApiError> = Err(ApiError::RateLimited);
             let backoff = Backoff::new();
-            assert!(!should_fetch_profile(&result, &backoff, None, Utc::now()));
+            assert!(!should_fetch_profile(
+                &result,
+                &backoff,
+                false,
+                None,
+                Utc::now()
+            ));
         }
 
         /// The ordinary path is unaffected: a successful poll, nothing ever
@@ -513,7 +542,13 @@ mod tests {
         fn due_when_this_poll_succeeds_and_nothing_indicates_trouble() {
             let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
             let backoff = Backoff::new();
-            assert!(should_fetch_profile(&result, &backoff, None, Utc::now()));
+            assert!(should_fetch_profile(
+                &result,
+                &backoff,
+                false,
+                None,
+                Utc::now()
+            ));
         }
 
         /// A backoff already active from an earlier iteration still holds
@@ -525,7 +560,13 @@ mod tests {
             let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
             let mut backoff = Backoff::new();
             backoff.on_rate_limited();
-            assert!(!should_fetch_profile(&result, &backoff, None, Utc::now()));
+            assert!(!should_fetch_profile(
+                &result,
+                &backoff,
+                false,
+                None,
+                Utc::now()
+            ));
         }
 
         /// Staleness still gates through the composition end to end: a
@@ -539,7 +580,29 @@ mod tests {
             assert!(!should_fetch_profile(
                 &result,
                 &backoff,
+                false,
                 Some(fetched_at),
+                Utc::now()
+            ));
+        }
+
+        /// The 401 retry pass. `decide` answers a first `SignedOut` with
+        /// `RetryAuthOnce`, and the loop `continue`s straight into another
+        /// poll with no wait at all — deliberately, since the token has
+        /// usually just rotated. What must not come with it is a second
+        /// profile fetch: `profile_is_due` still says due on both passes
+        /// whenever no profile has ever been cached, so the retry turned two
+        /// requests into four inside about a second, which is the shape the
+        /// module header documents as tripping this endpoint's burst limit.
+        #[test]
+        fn not_due_on_the_immediate_re_auth_retry_pass() {
+            let result: Result<Vec<Quota>, ApiError> = Err(ApiError::SignedOut);
+            let backoff = Backoff::new();
+            assert!(!should_fetch_profile(
+                &result,
+                &backoff,
+                true,
+                None,
                 Utc::now()
             ));
         }
@@ -550,7 +613,13 @@ mod tests {
         fn a_non_rate_limit_failure_this_poll_does_not_hold_the_fetch_back_by_itself() {
             let result: Result<Vec<Quota>, ApiError> = Err(ApiError::SignedOut);
             let backoff = Backoff::new();
-            assert!(should_fetch_profile(&result, &backoff, None, Utc::now()));
+            assert!(should_fetch_profile(
+                &result,
+                &backoff,
+                false,
+                None,
+                Utc::now()
+            ));
         }
     }
 
