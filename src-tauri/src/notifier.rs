@@ -13,6 +13,9 @@ pub struct Notification {
 
 #[derive(Debug, Clone)]
 struct Armed {
+    /// The highest level already accounted for in this window: a threshold
+    /// that fired, or — on the quota's first sight — the percentage that was
+    /// simply observed. See `primed_level`.
     highest_fired: u8,
     window: Option<DateTime<Utc>>,
 }
@@ -23,6 +26,25 @@ struct Armed {
 /// work either. A genuine reset jumps it forward by the whole window, five
 /// hours at the shortest, so anything closer than this is the same window.
 const SAME_WINDOW_TOLERANCE_SECS: i64 = 5 * 60;
+
+/// What priming records on the first sight of a quota: the observed
+/// percentage itself, floored to a whole percent, rather than the highest
+/// configured threshold beneath it.
+///
+/// The distinction is invisible while notifications are on (every threshold
+/// is an integer, so the floored percentage is never below the highest one
+/// crossed) and load-bearing while they are off. With notifications off,
+/// `settings::sanitized()` hands `evaluate` an empty threshold list, so
+/// nothing counts as crossed and a threshold-derived priming would record 0 —
+/// and the first poll after the user switches notifications back on would
+/// then announce levels crossed while this app was watching and deliberately
+/// silent. The record has to reflect what was seen, not what was enabled.
+fn primed_level(percent: f64) -> u8 {
+    // `as u8` on a float saturates rather than wrapping, and every threshold
+    // is <= 100, so clamping here only makes the stored value readable as the
+    // percentage it is.
+    percent.floor().clamp(0.0, 100.0) as u8
+}
 
 fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -> bool {
     match (stored, incoming) {
@@ -41,8 +63,9 @@ fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -
 ///
 /// Notifies on transitions this app has observed, not on state it inherited
 /// at startup (spec §10.2): the first `evaluate` call for a given quota id
-/// primes its thresholds already crossed as silently announced, rather than
-/// firing for them. This matters for two reasons — a fresh install should not
+/// primes whatever it was already at as silently announced, rather than
+/// firing for it — and primes it from the observed percentage, so the record
+/// holds even if notifications were off at the time (`primed_level`). This matters for two reasons — a fresh install should not
 /// carpet-bomb someone who was already at 85% with banners for 50 and 80, and
 /// on macOS a first-ever launch spends its opening seconds inside the OS's own
 /// notification-authorization window, where anything posted is delivered but
@@ -70,11 +93,14 @@ impl Notifier {
 
             match self.state.entry(quota.id.clone()) {
                 Entry::Vacant(slot) => {
-                    // First sight of this quota id: record whatever was
-                    // already crossed as already-announced, but never fire —
-                    // that state was inherited, not observed.
+                    // First sight of this quota id: record where it already
+                    // stood as already-announced, but never fire — that state
+                    // was inherited, not observed. Recorded from the
+                    // percentage rather than from the thresholds, so an
+                    // empty threshold list (notifications off) still leaves a
+                    // faithful record; see `primed_level`.
                     slot.insert(Armed {
-                        highest_fired: crossed.unwrap_or(0),
+                        highest_fired: primed_level(quota.percent),
                         window: quota.resets_at,
                     });
                 }
@@ -257,6 +283,38 @@ mod tests {
             .evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS)
             .is_empty());
         // ...but crossing 90 afterwards is a transition this app observed.
+        let fired = notifier.evaluate(&[quota(92.0, reset_at(10))], &THRESHOLDS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].threshold, 90);
+    }
+
+    /// The second door into the priming rule. With notifications off at
+    /// launch, `settings::sanitized()` clears the threshold list, so nothing
+    /// counted as crossed and priming recorded 0 — and the first poll after
+    /// the user turned notifications back on then fired for thresholds that
+    /// had been crossed the whole time the app was watching, silently. That
+    /// is exactly the state the priming rule exists to refuse to announce.
+    /// Priming has to record what was observed, not what was enabled.
+    #[test]
+    fn thresholds_crossed_while_notifications_were_off_stay_silent_when_they_come_back_on() {
+        let mut notifier = Notifier::new();
+        // Notifications off at launch: the threshold list arrives empty.
+        assert!(notifier
+            .evaluate(&[quota(85.0, reset_at(10))], &[])
+            .is_empty());
+
+        // Switched on again, same window, same 85%.
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS)
+                .is_empty(),
+            "50 and 80 were crossed before the switch was flipped — this app \
+             watched it happen without announcing it, so turning notifications \
+             on must not announce it retroactively"
+        );
+
+        // Crossing 90 afterwards is still a transition this app observed, so
+        // priming must not have swallowed the whole window either.
         let fired = notifier.evaluate(&[quota(92.0, reset_at(10))], &THRESHOLDS);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].threshold, 90);
