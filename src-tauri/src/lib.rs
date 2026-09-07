@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod model;
+pub mod poller;
 pub mod profile;
 pub mod usage;
 
