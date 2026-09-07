@@ -199,6 +199,52 @@ mod tests {
         assert_eq!(fired.len(), 2);
     }
 
+    /// Guards the reason the anchor is kept fixed rather than refreshed to
+    /// the latest value every poll: an implementation that refreshes it would
+    /// compare each step only to its immediate predecessor, so a slow march
+    /// away from the window's first-seen value — a few minutes at a time,
+    /// each step comfortably inside the tolerance — would never be caught; it
+    /// would stay "the same window" forever no matter how far it wandered.
+    /// The fixed anchor cannot do that: because every step is compared
+    /// against the *first* value seen for this window, cumulative drift past
+    /// the tolerance is always eventually caught and the window re-arms.
+    ///
+    /// (This is also, honestly, a case where a literal "nothing ever re-fires
+    /// while pairwise steps stay small" test would be false against the
+    /// correct, shipped implementation: with the anchor fixed, drift that
+    /// stays under tolerance step-to-step but exceeds it cumulatively *does*
+    /// eventually trip a fresh re-arm here — three times, in fact, across six
+    /// four-minute steps — which is the intended behaviour, not a bug. What a
+    /// refresh-every-poll bug actually produces is silence forever instead.)
+    #[test]
+    fn a_slow_drift_past_the_tolerance_is_eventually_caught() {
+        let mut notifier = Notifier::new();
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+
+        // Six polls, four minutes apart. Every consecutive pair is well
+        // inside the 5-minute tolerance, but by the third poll the total
+        // drift from the window's first-seen anchor (8 minutes) exceeds it.
+        let first_fired = notifier.evaluate(&[quota(55.0, Some(t0))], &THRESHOLDS);
+        assert_eq!(first_fired.len(), 1, "the initial crossing must still fire");
+
+        let mut saw_a_later_notification = false;
+        for step in 1..6 {
+            let t = t0 + chrono::Duration::minutes(4 * step);
+            let fired = notifier.evaluate(&[quota(55.0, Some(t))], &THRESHOLDS);
+            if !fired.is_empty() {
+                saw_a_later_notification = true;
+            }
+        }
+
+        assert!(
+            saw_a_later_notification,
+            "cumulative drift past the tolerance must eventually re-arm the \
+             threshold — an implementation that refreshes the anchor to the \
+             latest value every poll would instead stay silent through all \
+             six steps, never noticing the drift"
+        );
+    }
+
     /// The server recomputes `resets_at` per request, so it wobbles between
     /// polls. Exact equality reads that as a new window and re-fires every
     /// notification on every poll — verified against the live API, where three
