@@ -188,7 +188,13 @@ enum MenuRow {
 /// Every row below the quota list, in order. `build_menu` renders exactly
 /// this list, so a unit test asserting against it is asserting against what
 /// actually ships, not a description that could drift from it.
-fn trailing_rows() -> Vec<MenuRow> {
+///
+/// `check_updates_label` is a parameter rather than a literal here because
+/// `tray::apply` calls `build_menu` fresh on every poll: the label has to be
+/// derived from `updater::UpdateCheckStatus` at each rebuild (see that
+/// module), or the very next poll — seconds later — would silently wipe
+/// whatever a check just reported.
+fn trailing_rows(check_updates_label: String) -> Vec<MenuRow> {
     use MenuRow::{Item, Separator};
     vec![
         Item {
@@ -217,7 +223,7 @@ fn trailing_rows() -> Vec<MenuRow> {
         },
         Item {
             id: "check_updates",
-            label: "Check for Updates…".to_string(),
+            label: check_updates_label,
             enabled: true,
         },
         Separator,
@@ -238,7 +244,11 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, labels: &[String]) -> tauri::Resul
     if !labels.is_empty() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
-    for row in trailing_rows() {
+    let check_updates_label = app
+        .try_state::<std::sync::Arc<crate::updater::UpdateCheckStatus>>()
+        .map(|status| status.label())
+        .unwrap_or_else(|| "Check for Updates…".to_string());
+    for row in trailing_rows(check_updates_label) {
         match row {
             MenuRow::Item { id, label, enabled } => {
                 menu.append(&MenuItem::with_id(app, id, label, enabled, None::<&str>)?)?;
@@ -583,14 +593,16 @@ mod tests {
     }
 
     /// Proves the menu is wired: `About` is present, disabled, and names the
-    /// running version; `Check for Updates…` is present and enabled; both
-    /// sit above `Quit`. Asserted against `trailing_rows()` — the exact data
-    /// `build_menu` renders — rather than a live `muda::Menu`, which refuses
-    /// to build off the main thread and so cannot be constructed inside a
-    /// `#[test]` on macOS.
+    /// running version; `Check for Updates…` carries whatever label the
+    /// caller supplied (the live label comes from
+    /// `updater::UpdateCheckStatus`, exercised in `updater.rs`'s own tests)
+    /// and is enabled; both sit above `Quit`. Asserted against
+    /// `trailing_rows()` — the exact data `build_menu` renders — rather
+    /// than a live `muda::Menu`, which refuses to build off the main thread
+    /// and so cannot be constructed inside a `#[test]` on macOS.
     #[test]
     fn about_and_check_for_updates_sit_above_quit() {
-        let items: Vec<(&str, String, bool)> = trailing_rows()
+        let items: Vec<(&str, String, bool)> = trailing_rows("Check for Updates…".to_string())
             .into_iter()
             .filter_map(|row| match row {
                 MenuRow::Item { id, label, enabled } => Some((id, label, enabled)),
@@ -622,5 +634,25 @@ mod tests {
         let position = |id: &str| ids.iter().position(|&candidate| candidate == id).unwrap();
         assert!(position("about") < position("quit"));
         assert!(position("check_updates") < position("quit"));
+    }
+
+    /// The label parameter really does reach the rendered row, not just the
+    /// idle default — the case that matters since `build_menu` passes
+    /// `updater::UpdateCheckStatus::label()`'s live output here on every
+    /// rebuild.
+    #[test]
+    fn the_check_updates_row_carries_whatever_label_it_is_given() {
+        let items: Vec<(&str, String, bool)> = trailing_rows("Checking for updates…".to_string())
+            .into_iter()
+            .filter_map(|row| match row {
+                MenuRow::Item { id, label, enabled } => Some((id, label, enabled)),
+                MenuRow::Separator => None,
+            })
+            .collect();
+        let (_, check_label, _) = items
+            .iter()
+            .find(|(id, _, _)| *id == "check_updates")
+            .expect("Check for Updates… item missing");
+        assert_eq!(*check_label, "Checking for updates…");
     }
 }

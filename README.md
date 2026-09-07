@@ -99,18 +99,25 @@ Log out and back in if the icon does not appear.
 ## Updating
 
 If you installed a release build, choose **Check for Updates…** from the tray
-menu. It downloads and installs any newer release and restarts the app; if the
-check fails or none is available, it says so via a system notification rather
-than doing nothing.
+menu. It downloads and installs any newer release and restarts the app. While
+it's running, the same menu item's label changes to **Checking for
+updates…**, then to **Up to date (vX.Y.Z)**, **Update available —
+installing…**, or **Check failed —** followed by a short reason, for about
+30 seconds, before returning to normal. That label is the outcome — read it
+there, not from a popup.
 
-That notification is itself not guaranteed to reach you — notification
-permission can be revoked, or a minimal Linux desktop may have no
-notification daemon running at all. If showing it fails, the app falls back
-to the tray icon's tooltip and a line on stderr. On Ubuntu specifically, the
-tooltip fallback is a documented no-op in the AppIndicator tray backend this
-app uses, so on Linux, if the notification itself cannot be shown, stderr —
-visible only if you launched the app from a terminal — is the only channel
-left. This gap is known and is not otherwise worked around.
+The app also tries to show a system notification with the same outcome, but
+that is a courtesy, not a guarantee: the notification plugin this app uses
+cannot report whether a notification was ever actually displayed (notification
+permission can be revoked, or a minimal Linux desktop may have no notification
+daemon at all, and either way the call still reports success). For the same
+reason, a tray-icon tooltip carrying the outcome is set alongside the
+notification as a second best-effort echo — worth checking by hovering the
+icon if you're not sure you saw a notification — but on Ubuntu specifically
+it is a documented no-op in the AppIndicator backend this app uses, so it
+never actually appears there. The **menu label is the only channel this
+feature actually depends on**, precisely because it is the one this app fully
+controls.
 
 If you're running from a source checkout instead:
 

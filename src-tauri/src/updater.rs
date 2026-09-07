@@ -10,8 +10,31 @@
 //! explicit menu item is honest about when a network request happens and
 //! adds no startup latency. Once the mechanism has proven itself in the
 //! wild, automatic checking can follow.
+//!
+//! **The system notification is best-effort, not the channel this feature
+//! depends on.** `tauri_plugin_notification` 2.4.0's `show()` (read in
+//! `tauri-plugin-notification-2.4.0/src/desktop.rs:179-217`) hands the real
+//! OS dispatch to a detached `tauri::async_runtime::spawn` and discards
+//! *that* task's result (`let _ = notification.show();`), then returns
+//! `Ok(())` unconditionally — the only fallible step in the function is
+//! gated to `#[cfg(windows)]`, and this project does not ship Windows. So on
+//! macOS and Linux, `.show()` cannot report a revoked permission or a
+//! missing notification daemon; it always claims success. Wrapping that
+//! call's `Result` cannot be a fallback for those failure modes, because
+//! that branch is unreachable for them — an earlier version of this module
+//! did exactly that and was wrong to.
+//!
+//! The channel that actually works is [`UpdateCheckStatus`]: the outcome of
+//! the last check, held in `.manage()`d state and rendered fresh into the
+//! `Check for Updates…` menu label every time `tray::apply` rebuilds the
+//! menu. The user clicked a menu item; the answer belongs in that menu,
+//! where this app controls delivery completely — nothing about it depends
+//! on an OS notification daemon existing.
 
-use tauri::AppHandle;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -31,7 +54,9 @@ pub enum CheckOutcome {
 }
 
 impl CheckOutcome {
-    /// Title and body for the system notification reporting this outcome.
+    /// Title and body for the best-effort system notification. See the
+    /// module doc comment: showing it can silently do nothing, so this is
+    /// never the only place an outcome is recorded.
     fn notification(&self) -> (String, String) {
         match self {
             CheckOutcome::Installing { version } => (
@@ -48,62 +73,135 @@ impl CheckOutcome {
             ),
         }
     }
+
+    /// The `Check for Updates…` menu label while this outcome is showing —
+    /// the channel this feature actually depends on.
+    fn menu_label(&self) -> String {
+        match self {
+            CheckOutcome::Installing { .. } => "Update available — installing…".to_string(),
+            CheckOutcome::UpToDate => format!("Up to date (v{})", env!("CARGO_PKG_VERSION")),
+            CheckOutcome::Failed { reason } => format!("Check failed — {}", short_reason(reason)),
+        }
+    }
 }
 
-/// Runs one check and reports the outcome to the user unconditionally, then
-/// restarts the app if an update was installed.
+/// Keeps a failure reason short enough to sit in one menu row. A `reqwest`
+/// or signature-verification error's `Display` text can run well past what
+/// a menu should stretch to.
+fn short_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 40;
+    if reason.chars().count() <= MAX_CHARS {
+        reason.to_string()
+    } else {
+        let truncated: String = reason.chars().take(MAX_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// How long a completed outcome stays in the menu label before falling back
+/// to idle. Checked lazily whenever the label is read — `tray::apply`
+/// rebuilds the menu on every poll, so that read already happens regularly
+/// enough that no separate timer is needed to clear it.
+const OUTCOME_VISIBLE_FOR: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Default)]
+enum CheckState {
+    #[default]
+    Idle,
+    Checking,
+    Done {
+        outcome: CheckOutcome,
+        at: Instant,
+    },
+}
+
+/// `.manage()`d state behind the `Check for Updates…` menu label — see the
+/// module doc comment for why this, and not the system notification, is
+/// the channel this feature depends on.
+#[derive(Default)]
+pub struct UpdateCheckStatus(Mutex<CheckState>);
+
+impl UpdateCheckStatus {
+    fn set_checking(&self) {
+        *self.0.lock().unwrap() = CheckState::Checking;
+    }
+
+    fn set_done(&self, outcome: CheckOutcome) {
+        *self.0.lock().unwrap() = CheckState::Done {
+            outcome,
+            at: Instant::now(),
+        };
+    }
+
+    /// The label to render right now. Expires a completed outcome back to
+    /// idle once it has been showing for `OUTCOME_VISIBLE_FOR`; reading the
+    /// label before that never resets it — two menu rebuilds in a row while
+    /// an outcome is still fresh both see the same text.
+    pub fn label(&self) -> String {
+        let mut state = self.0.lock().unwrap();
+        if let CheckState::Done { at, .. } = &*state {
+            if at.elapsed() >= OUTCOME_VISIBLE_FOR {
+                *state = CheckState::Idle;
+            }
+        }
+        match &*state {
+            CheckState::Idle => "Check for Updates…".to_string(),
+            CheckState::Checking => "Checking for updates…".to_string(),
+            CheckState::Done { outcome, .. } => outcome.menu_label(),
+        }
+    }
+}
+
+/// Runs one check, updates the shared status the menu label reads from, and
+/// restarts the app if an update was installed. Also shows a best-effort
+/// system notification — genuinely nicer when it works, but see the module
+/// doc comment for why it is never the thing being depended on.
 ///
 /// Spawned rather than run inline because `check()` and `download_and_install()`
-/// are async while the menu event handler that calls this is not.
+/// are async while the menu event handler that calls this is not. The status
+/// is set to `Checking` synchronously, before the async work is scheduled,
+/// so the very next menu rebuild already reflects that a check is running.
 pub fn spawn_check(app: AppHandle) {
+    if let Some(status) = app.try_state::<std::sync::Arc<UpdateCheckStatus>>() {
+        status.set_checking();
+    }
     tauri::async_runtime::spawn(async move {
         let outcome = run_check(&app).await;
-        report(&app, &outcome);
+        if let Some(status) = app.try_state::<std::sync::Arc<UpdateCheckStatus>>() {
+            status.set_done(outcome.clone());
+        }
+        notify(&app, &outcome);
         if let CheckOutcome::Installing { .. } = outcome {
             app.restart();
         }
     });
 }
 
-/// Delivers an outcome to the user. The system notification is the primary
-/// channel, but showing it is itself fallible — notification permission
-/// revoked, no notification daemon on a minimal Linux desktop, any other
-/// OS-level refusal — and a `Check for Updates…` that produces nothing at
-/// all in that case is exactly the failure mode this module exists to rule
-/// out, for every outcome, `Failed` included.
-///
-/// On that failure this falls back to the tray icon's tooltip (persists
-/// until replaced, discoverable by hovering) and a stderr line. Neither is
-/// as good as the notification: the tooltip is a documented no-op on Linux
-/// in the `tray-icon` crate's GTK/AppIndicator backend (confirmed by
-/// reading `tray-icon-0.24.2/src/platform_impl/gtk/mod.rs`, whose
-/// `set_tooltip` always returns `Ok(())` without doing anything — so on
-/// Linux this call "succeeds" and nothing becomes visible), and stderr is
-/// only seen by someone who launched the app from a terminal rather than
-/// via autostart. On Linux specifically, if the notification daemon is the
-/// thing that failed, there is genuinely no channel left that is both
-/// reliable and visible without a dialog dependency this project has not
-/// taken on — that residual gap is real and is documented in the README
-/// rather than left to be discovered.
-fn report(app: &AppHandle, outcome: &CheckOutcome) {
+/// Shows the best-effort system notification for `outcome`, and echoes the
+/// same text onto the tray icon's tooltip as a second, equally best-effort
+/// signal — not a guarantee, since neither call can report whether anything
+/// actually became visible (see the module doc comment). On Linux, the
+/// tooltip echo is itself a documented no-op in the `tray-icon` crate's
+/// GTK/AppIndicator backend (confirmed by reading
+/// `tray-icon-0.24.2/src/platform_impl/gtk/mod.rs`, whose `set_tooltip`
+/// always returns `Ok(())` without doing anything); on macOS it genuinely
+/// sets the native tooltip. Either way, the menu label — not this function
+/// — is what the feature actually depends on.
+fn notify(app: &AppHandle, outcome: &CheckOutcome) {
     let (title, body) = outcome.notification();
-    if let Err(e) = app
+    let _ = app
         .notification()
         .builder()
         .title(title.clone())
         .body(body.clone())
-        .show()
-    {
-        let line = fallback_text(&title, &body);
-        eprintln!("failed to show update-check notification ({line}): {e}");
-        if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
-            let _ = tray.set_tooltip(Some(line));
-        }
+        .show();
+    if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+        let _ = tray.set_tooltip(Some(tooltip_line(&title, &body)));
     }
 }
 
-/// The single line shared by the tray-tooltip and stderr fallbacks.
-fn fallback_text(title: &str, body: &str) -> String {
+/// The single line the tray tooltip echo uses.
+fn tooltip_line(title: &str, body: &str) -> String {
     format!("{title}: {body}")
 }
 
@@ -207,23 +305,99 @@ mod tests {
     }
 
     #[test]
-    fn the_fallback_line_combines_title_and_body() {
+    fn the_tooltip_line_combines_title_and_body() {
         assert_eq!(
-            fallback_text("Claude Usage update check failed", "boom"),
+            tooltip_line("Claude Usage update check failed", "boom"),
             "Claude Usage update check failed: boom"
         );
     }
 
-    // `report`'s fallback path (the tray tooltip and the stderr line, taken
-    // when `.show()` itself fails) is not exercised by a test. Forcing that
-    // failure deterministically would require `tauri_plugin_notification`'s
-    // `.show()` to fail on command — but it calls straight into the real OS
-    // notification stack (`notify-rust` on desktop) regardless of
-    // `tauri::test::MockRuntime`, which stubs the windowing runtime, not the
-    // notification plugin's own OS calls. Making that failure injectable
-    // would mean adding fault-injection scaffolding to `report` for the
-    // sake of one fallback path, which is not warranted here. This is
-    // stated plainly rather than papered over with a test that stops at
-    // `notification()`'s string output, one layer above delivery, the way
-    // the three tests above do.
+    // The system notification's own delivery is not exercised by a test.
+    // `tauri_plugin_notification`'s `.show()` calls straight into the real
+    // OS notification stack (`notify-rust` on desktop) regardless of
+    // `tauri::test::MockRuntime`, and — per the module doc comment — always
+    // returns `Ok(())` on the platforms this app ships, so there is nothing
+    // for a test to observe there even in principle. That is exactly why
+    // the menu label below, not the notification, is what is tested as the
+    // feature's real channel.
+
+    #[test]
+    fn each_outcome_maps_to_its_menu_label() {
+        assert_eq!(
+            CheckOutcome::Installing {
+                version: "0.2.0".into()
+            }
+            .menu_label(),
+            "Update available — installing…"
+        );
+        assert_eq!(
+            CheckOutcome::UpToDate.menu_label(),
+            format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            CheckOutcome::Failed {
+                reason: "boom".into()
+            }
+            .menu_label(),
+            "Check failed — boom"
+        );
+    }
+
+    #[test]
+    fn a_long_failure_reason_is_truncated_in_the_menu_label() {
+        let reason = "x".repeat(100);
+        let label = CheckOutcome::Failed {
+            reason: reason.clone(),
+        }
+        .menu_label();
+        assert!(label.starts_with("Check failed — "));
+        assert!(label.chars().count() < reason.chars().count());
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn the_status_starts_idle_and_reflects_a_check_in_flight() {
+        let status = UpdateCheckStatus::default();
+        assert_eq!(status.label(), "Check for Updates…");
+        status.set_checking();
+        assert_eq!(status.label(), "Checking for updates…");
+    }
+
+    /// The requirement R51 exists for: `tray::apply` rebuilds the whole
+    /// menu on every poll, so if the label were derived once and baked into
+    /// the menu rather than read fresh from this state, the very next poll
+    /// — seconds later — would silently wipe it. Reading the label twice in
+    /// a row, simulating two such rebuilds while the outcome is still
+    /// fresh, must return the same text both times.
+    #[test]
+    fn a_done_outcome_survives_being_read_across_multiple_menu_rebuilds() {
+        let status = UpdateCheckStatus::default();
+        status.set_done(CheckOutcome::UpToDate);
+        let first_rebuild = status.label();
+        let second_rebuild = status.label();
+        assert_eq!(first_rebuild, second_rebuild);
+        assert_eq!(
+            first_rebuild,
+            format!("Up to date (v{})", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn a_done_outcome_expires_back_to_idle_after_the_visible_window() {
+        let status = UpdateCheckStatus::default();
+        status.set_done(CheckOutcome::Failed {
+            reason: "boom".into(),
+        });
+        // Back-date the outcome rather than sleeping the test suite for
+        // `OUTCOME_VISIBLE_FOR` — `Instant` supports subtracting a
+        // `Duration` directly, so this is a real elapsed-time check, not a
+        // mocked clock.
+        {
+            let mut state = status.0.lock().unwrap();
+            if let CheckState::Done { at, .. } = &mut *state {
+                *at = Instant::now() - OUTCOME_VISIBLE_FOR - Duration::from_secs(1);
+            }
+        }
+        assert_eq!(status.label(), "Check for Updates…");
+    }
 }
