@@ -1,6 +1,7 @@
 # Local-only working files, never published
 docs/
 .claude/
+.superpowers/
 
 # Rust / Tauri
 /src-tauri/target/
