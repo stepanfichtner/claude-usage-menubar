@@ -647,12 +647,15 @@ mod tests {
     /// minutes rather than five: the condition it answers lasts about two.
     ///
     /// The other throttle tests are deliberately symbolic, so this is the only
-    /// place the absolute values are pinned. Changing either constant should
-    /// mean re-measuring, not editing this test.
+    /// place the absolute values are pinned — the manual-refresh throttle, the
+    /// backoff steps, and `settings::MIN_POLL_INTERVAL_SECS`, which the same
+    /// burst-sensitivity and ~2-minute-recovery measurement justifies. Changing
+    /// any of them should mean re-measuring, not editing this test.
     #[test]
     fn the_measured_rate_limit_values_are_what_ship() {
         assert_eq!(MIN_MANUAL_REFRESH_SECS, 60);
         assert_eq!(BACKOFF_STEPS, [2 * 60, 5 * 60, 15 * 60]);
+        assert_eq!(crate::settings::MIN_POLL_INTERVAL_SECS, 60);
     }
 
     #[test]

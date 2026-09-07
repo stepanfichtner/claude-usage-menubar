@@ -1,8 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { now, snapshot } from "./lib/stores";
-  import { formatCompact } from "./lib/countdown";
   import { mergeTitleEntries, type TitleEntry } from "./lib/titleEntries";
+  import { renderTitle } from "./lib/titlePreview";
 
   interface Settings {
     pollIntervalSecs: number;
@@ -66,29 +66,13 @@
     return $snapshot?.snapshot.quotas.find((q) => q.id === quotaId)?.label ?? quotaId;
   }
 
-  // Mirrors `tray::render_title` on the Rust side exactly: same quotas, same
-  // filter (an entry with nothing to show, or whose quota isn't in this
-  // snapshot, drops out entirely rather than leaving a blank segment), same
-  // "percent · countdown" and two-space join. Built entirely from data this
-  // window already holds for `labelFor` above plus the checkboxes below, so
-  // it costs no extra command or round trip.
-  let previewTitle = $derived.by(() => {
-    if (!settings) return "";
-    const quotas = $snapshot?.snapshot.quotas ?? [];
-    return settings.titleEntries
-      .map((entry) => {
-        const quota = quotas.find((q) => q.id === entry.quotaId);
-        if (!quota) return null;
-        const parts: string[] = [];
-        if (entry.showPercent) parts.push(`${Math.round(quota.percent)}%`);
-        if (entry.showCountdown && quota.resetsAt) {
-          parts.push(formatCompact(quota.resetsAt, $now));
-        }
-        return parts.length > 0 ? parts.join(" · ") : null;
-      })
-      .filter((segment): segment is string => segment !== null)
-      .join("  ");
-  });
+  // Built entirely from data this window already holds — the subscribed
+  // snapshot plus the checkboxes below — so it costs no extra command or
+  // round trip. `renderTitle` (src/lib/titlePreview.ts) mirrors
+  // `tray::render_title` on the Rust side and carries its own tests.
+  let previewTitle = $derived(
+    settings ? renderTitle($snapshot?.snapshot.quotas ?? [], settings.titleEntries, $now) : "",
+  );
 
   async function persist() {
     if (!settings) return;
@@ -208,7 +192,7 @@
                 <p class="quota-name">{labelFor(entry.quotaId)}</p>
                 <label class="check">
                   <input type="checkbox" bind:checked={entry.showPercent} />
-                  Percentage remaining
+                  Percentage used
                 </label>
                 <label class="check">
                   <input type="checkbox" bind:checked={entry.showCountdown} />
@@ -324,17 +308,17 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    /* Fits the two default quotas fully; a third or fourth (the API can
+    /* Fits the two default quotas with a little headroom to spare — the
+       extra bottom padding means that headroom is unused blank space, not a
+       border sitting flush against the cap. A third or fourth (the API can
        return up to four: session plus three weekly variants) scrolls within
-       this list rather than resizing the window around an uncommon case.
-       The fade starts right at that two-item boundary, so a partially
-       clipped third group fades to nothing instead of showing a header with
-       no checkboxes under it. */
+       this list rather than resizing the window around an uncommon case; no
+       fade on the edge, since a partially visible header on a scrolled-past
+       group is the one cue this list has that there's more below it. */
     max-height: 200px;
     overflow-y: auto;
     padding-right: 2px;
-    mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
-    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+    padding-bottom: 8px;
   }
   .quota-group {
     border: 1px solid var(--border);
@@ -367,6 +351,13 @@
     border-radius: 6px;
     padding: 8px 10px;
     font-size: 13px;
+    /* `renderTitle` joins entries with two literal spaces (mirroring
+       `tray.rs`'s own join) specifically to keep separate quotas apart from
+       each other and from the " · " within one quota's segment. Plain
+       `white-space` would collapse that pair to one space, making the two
+       gaps indistinguishable; `pre-wrap` preserves it while still wrapping
+       at whitespace when the line is too long for the box. */
+    white-space: pre-wrap;
     overflow-wrap: break-word;
   }
 
