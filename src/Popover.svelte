@@ -3,6 +3,7 @@
   import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import SettingsIcon from "@lucide/svelte/icons/settings";
+  import AnalyticsTab from "./lib/AnalyticsTab.svelte";
   import Callout from "./lib/Callout.svelte";
   import Ring from "./lib/Ring.svelte";
   import QuotaCard from "./lib/QuotaCard.svelte";
@@ -43,6 +44,36 @@
   }
 
   let mainEl: HTMLElement | undefined = $state();
+
+  // The Usage tab is optional and off by default, so the nav only exists once
+  // the setting is on. Re-read on every snapshot rather than once at startup:
+  // saving settings asks the poller for a refresh, so a snapshot is this
+  // window's cue that a setting may have changed, and without it turning
+  // analytics on would not surface the tab until the next launch.
+  let tab = $state<"limits" | "analytics">("limits");
+  let analyticsEnabled = $state(false);
+
+  function readAnalyticsSetting() {
+    invoke<{ analyticsEnabled: boolean }>("get_settings")
+      .then((s) => {
+        analyticsEnabled = s.analyticsEnabled;
+        // Switched off while it was showing: fall back rather than leaving the
+        // panel on a tab with no way back to it.
+        if (!analyticsEnabled) tab = "limits";
+      })
+      .catch(() => {});
+  }
+  readAnalyticsSetting();
+  $effect(() => {
+    void $snapshot;
+    readAnalyticsSetting();
+  });
+
+  // Bumped when the Usage tab finishes loading. The resize effect below keys
+  // off snapshots, and the analytics summary arrives on its own schedule with
+  // a content height of its own; without this the window would keep whatever
+  // height the Limits tab last asked for and the tab would scroll inside it.
+  let contentTick = $state(0);
 
   // Acknowledges the click, nothing more. A throttled or rate-limited
   // refresh emits no snapshot event at all (poller.rs's `Decision::Wait`
@@ -118,7 +149,11 @@
   // reports that true content height, only bottoming out at `max-height`
   // once content genuinely exceeds it (see the stylesheet below).
   $effect(() => {
-    void $snapshot; // re-measure whenever the content changes
+    // Re-measure whenever the content changes: a new snapshot, a switch
+    // between tabs, or the Usage tab's summary landing.
+    void $snapshot;
+    void tab;
+    void contentTick;
     if (!tauriWindow) return;
     requestAnimationFrame(() => {
       if (!mainEl) return;
@@ -146,7 +181,19 @@
     </button>
   </header>
 
-  {#if $snapshot?.signedOut}
+  {#if analyticsEnabled}
+    <nav>
+      <button class:on={tab === "limits"} onclick={() => (tab = "limits")}>Limits</button>
+      <button class:on={tab === "analytics"} onclick={() => (tab = "analytics")}>Usage</button>
+    </nav>
+  {/if}
+
+  <!-- The Usage tab reads local transcripts, not the endpoint, so it comes
+       before the signed-out and loading branches: it has something to show
+       when they do not. -->
+  {#if tab === "analytics"}
+    <AnalyticsTab onloaded={() => contentTick++} />
+  {:else if $snapshot?.signedOut}
     <p class="empty">Sign in to Claude Code to see your usage.</p>
   {:else if !$snapshot}
     <p class="empty">Loading…</p>
@@ -224,6 +271,17 @@
     .icon-button.busy :global(svg) { animation: none; opacity: 0.5; }
   }
   .empty { padding: 24px 14px; text-align: center; color: var(--fg-muted); }
+
+  nav { display: flex; gap: 4px; padding: 0 10px 8px; }
+  nav button {
+    flex: 1;
+    justify-content: center;
+    padding: 5px;
+    border-radius: 6px;
+    font: inherit;
+    font-size: 12px;
+  }
+  nav button.on { background: var(--track); color: var(--fg); }
 
   .rings {
     display: grid;

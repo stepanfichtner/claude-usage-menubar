@@ -16,6 +16,7 @@
     thresholds: number[];
     notificationsEnabled: boolean;
     launchAtLogin: boolean;
+    analyticsEnabled: boolean;
   }
 
   // The only values worth offering: see `MIN_POLL_INTERVAL_SECS`'s doc
@@ -213,11 +214,27 @@
           </div>
         </div>
 
+        <!-- Two plain toggles, one rule above them rather than one between
+             them: a divider separating two single-line checkboxes reads as a
+             section break where there is no section. -->
         <div class="group">
           <label class="check">
             <input type="checkbox" bind:checked={settings.launchAtLogin} />
             Launch at login
           </label>
+
+          <!-- Removed for 0.1.0, which had no backend for it, and back now
+               that it does something. `analyticsEnabled` stayed in the stored
+               settings throughout, so a store written by 0.1.0 needs no
+               migration. -->
+          <label class="check">
+            <input type="checkbox" bind:checked={settings.analyticsEnabled} />
+            Show local token &amp; cost analytics
+          </label>
+          <p class="hint indent">
+            Adds a Usage tab estimating tokens and cost from Claude Code's
+            local transcripts. Nothing leaves this machine.
+          </p>
         </div>
       </section>
 
@@ -298,6 +315,12 @@
     font-size: 12px;
     line-height: 1.5;
   }
+  /* Aligned under the checkbox's label rather than its box, so it reads as
+     that setting's explanation and not as a new paragraph. */
+  .hint.indent { margin: 2px 0 0 24px; }
+  /* Separates the two toggles just enough that the hint below reads as
+     belonging to the second one rather than to the pair. */
+  .group label.check + label.check { margin-top: 8px; }
   .group + .group {
     border-top: 1px solid var(--border);
     padding-top: 14px;
