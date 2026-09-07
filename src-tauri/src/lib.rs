@@ -2,9 +2,9 @@
 
 pub fn run() {
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(|_app| {
             #[cfg(target_os = "macos")]
-            app.handle()
+            _app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
             Ok(())
         })
