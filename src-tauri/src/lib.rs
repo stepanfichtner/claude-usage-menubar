@@ -7,7 +7,11 @@ pub mod http;
 pub mod model;
 pub mod poller;
 pub mod profile;
+pub mod settings;
+pub mod tray;
 pub mod usage;
+
+use std::sync::Arc;
 
 /// One fetch, printed as JSON, no UI. The first thing to run when the endpoint
 /// changes (spec §15).
@@ -38,10 +42,16 @@ pub fn debug_once() {
 
 pub fn run() {
     tauri::Builder::default()
-        .setup(|_app| {
+        .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .manage(Arc::new(poller::RefreshSignal::default()))
+        .setup(|app| {
             #[cfg(target_os = "macos")]
-            _app.handle()
+            app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            tray::build(app.handle())?;
+            poller::spawn(app.handle().clone(), poller::PollConfig::default());
             Ok(())
         })
         .run(tauri::generate_context!())

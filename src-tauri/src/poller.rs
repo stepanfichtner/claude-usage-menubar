@@ -108,6 +108,167 @@ pub fn decide(
     }
 }
 
+use std::sync::Arc;
+
+use chrono::Duration as ChronoDuration;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::Notify;
+
+use crate::model::{Profile, UsageSnapshot};
+use crate::{cache, credentials, profile as profile_api, usage};
+
+pub const PROFILE_MAX_AGE_HOURS: i64 = 24;
+
+#[derive(Debug, Clone)]
+pub struct PollConfig {
+    pub base_interval: Duration,
+    pub base_url: String,
+}
+
+impl Default for PollConfig {
+    fn default() -> Self {
+        Self {
+            base_interval: Duration::from_secs(60),
+            base_url: usage::API_BASE.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotEvent {
+    pub snapshot: UsageSnapshot,
+    pub profile: Option<Profile>,
+    pub signed_out: bool,
+}
+
+/// Signals an out-of-band refresh (menu item, refresh button, popover opening),
+/// gated by the 20-second throttle above.
+#[derive(Default)]
+pub struct RefreshSignal {
+    notify: Notify,
+    throttle: std::sync::Mutex<RefreshThrottle>,
+}
+
+impl RefreshSignal {
+    /// Request a refresh. Returns whether it was let through.
+    pub fn request(&self) -> bool {
+        let allowed = self
+            .throttle
+            .lock()
+            .map(|mut throttle| throttle.allow(Utc::now()))
+            .unwrap_or(false);
+        if allowed {
+            self.notify.notify_one();
+        }
+        allowed
+    }
+
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
+pub fn spawn(app: AppHandle, config: PollConfig) {
+    tauri::async_runtime::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut backoff = Backoff::new();
+        let mut auth = AuthState::Ok;
+        let cache_dir = app
+            .path()
+            .app_cache_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        // Serve the cached snapshot immediately so the UI is never empty.
+        let mut profile = cache::load_profile(&cache_dir).map(|(p, _)| p);
+        let mut profile_fetched_at = cache::load_profile(&cache_dir).map(|(_, at)| at);
+        if let Some(cached) = cache::load_snapshot(&cache_dir) {
+            emit(&app, &cached, &profile, false);
+        }
+
+        let signal = app.state::<Arc<RefreshSignal>>().inner().clone();
+        let mut last_snapshot: Option<UsageSnapshot> = None;
+
+        loop {
+            let token = credentials::read_token().ok();
+            let result = match &token {
+                Some(token) => usage::fetch_usage(&client, &config.base_url, token).await,
+                None => Err(crate::error::ApiError::SignedOut),
+            };
+
+            match decide(&result, &mut backoff, &mut auth) {
+                Decision::RetryAuthOnce => continue,
+                Decision::Publish => {
+                    let quotas = result.unwrap_or_default();
+                    let snapshot = UsageSnapshot {
+                        quotas,
+                        fetched_at: Utc::now(),
+                        stale: false,
+                    };
+                    let _ = cache::save_snapshot(&cache_dir, &snapshot);
+
+                    // The plan changes a few times a year at most (spec §4.5).
+                    let stale_profile = profile_fetched_at
+                        .map(|at| Utc::now() - at > ChronoDuration::hours(PROFILE_MAX_AGE_HOURS))
+                        .unwrap_or(true);
+                    if stale_profile {
+                        if let Some(token) = &token {
+                            if let Ok(fresh) =
+                                profile_api::fetch_profile(&client, &config.base_url, token).await
+                            {
+                                let _ = cache::save_profile(&cache_dir, &fresh);
+                                profile_fetched_at = Some(Utc::now());
+                                profile = Some(fresh);
+                            }
+                        }
+                    }
+
+                    crate::tray::apply(&app, &snapshot);
+                    emit(&app, &snapshot, &profile, false);
+                    last_snapshot = Some(snapshot);
+                }
+                Decision::Wait => {
+                    if auth == AuthState::SignedOut {
+                        let empty = UsageSnapshot {
+                            quotas: Vec::new(),
+                            fetched_at: Utc::now(),
+                            stale: false,
+                        };
+                        crate::tray::apply(&app, &empty);
+                        emit(&app, &empty, &profile, true);
+                    } else if let Some(previous) = &last_snapshot {
+                        // Spec §7: keep showing the last figures, but say they
+                        // are no longer fresh.
+                        let stale = UsageSnapshot {
+                            stale: true,
+                            ..previous.clone()
+                        };
+                        emit(&app, &stale, &profile, false);
+                    }
+                }
+            }
+
+            let delay = backoff.next_delay(config.base_interval);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = signal.notified() => {}
+            }
+        }
+    });
+}
+
+fn emit(app: &AppHandle, snapshot: &UsageSnapshot, profile: &Option<Profile>, signed_out: bool) {
+    let _ = app.emit(
+        "usage://snapshot",
+        SnapshotEvent {
+            snapshot: snapshot.clone(),
+            profile: profile.clone(),
+            signed_out,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
