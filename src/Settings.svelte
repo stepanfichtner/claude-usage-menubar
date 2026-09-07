@@ -1,7 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { now, snapshot } from "./lib/stores";
-  import { mergeTitleEntries, type TitleEntry } from "./lib/titleEntries";
+  import {
+    mergeTitleEntries,
+    retireAbsentEntries,
+    type Absences,
+    type TitleEntry,
+  } from "./lib/titleEntries";
   import { renderTitle } from "./lib/titlePreview";
 
   interface Settings {
@@ -47,6 +52,13 @@
     }
   });
 
+  // Consecutive-absence tallies for `retireAbsentEntries`, deliberately a
+  // plain `let` and not `$state`: nothing renders it, and writing reactive
+  // state from the effect that reads it would re-trigger the effect. It
+  // starts empty every time this window's webview is created, which only
+  // ever makes retirement slower.
+  let absences: Absences = {};
+
   // One row per quota the app currently knows about, in addition to the ones
   // already in titleEntries — otherwise a quota that was never added to the
   // menu bar before (or is new) can never be ticked on. `mergeTitleEntries`
@@ -54,12 +66,24 @@
   // snapshot yet, signed out, a transient blip) leaves existing entries
   // untouched rather than wiping them, and an entry whose quota is missing
   // from this particular snapshot survives too.
+  //
+  // `retireAbsentEntries` is the bounded exception: an entry still missing
+  // after `RETIREMENT_MISSES` consecutive live, non-empty, non-signed-out
+  // snapshots is dropped, so a quota retired by a plan change stops showing
+  // a raw id above two checkboxes that cannot do anything. It keeps R43 —
+  // every untrustworthy snapshot returns everything untouched — and it only
+  // changes the in-memory list; nothing reaches the store until Save.
   $effect(() => {
     if (!settings) return;
-    settings.titleEntries = mergeTitleEntries(
-      settings.titleEntries,
-      $snapshot?.snapshot.quotas ?? [],
+    const event = $snapshot;
+    const merged = mergeTitleEntries(settings.titleEntries, event?.snapshot.quotas ?? []);
+    const retirement = retireAbsentEntries(
+      merged,
+      event && { ...event.snapshot, signedOut: event.signedOut },
+      absences,
     );
+    absences = retirement.absences;
+    settings.titleEntries = retirement.entries;
   });
 
   function labelFor(quotaId: string): string {
