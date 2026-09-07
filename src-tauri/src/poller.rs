@@ -63,6 +63,12 @@ impl Backoff {
             n => Duration::from_secs(BACKOFF_STEPS[(n - 1).min(BACKOFF_STEPS.len() - 1)]),
         }
     }
+
+    /// True while the last poll was rate-limited and the escalated wait has not
+    /// yet been served.
+    pub fn is_backing_off(&self) -> bool {
+        self.consecutive_rate_limits > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +211,29 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                 None => Err(crate::error::ApiError::SignedOut),
             };
 
+            // The plan changes a few times a year at most (spec §4.5). This
+            // runs whenever a token was readable, independent of whether the
+            // usage poll itself succeeded: a signed-out, offline or
+            // rate-limited usage poll must not also starve the profile of the
+            // one thing it needs, or the panel header sits on the "Claude
+            // usage" fallback until a usage poll finally succeeds — which
+            // under a sustained backoff can be a long wait. A failed profile
+            // fetch stays non-fatal: nothing here changes what happens next.
+            let stale_profile = profile_fetched_at
+                .map(|at| Utc::now() - at > ChronoDuration::hours(PROFILE_MAX_AGE_HOURS))
+                .unwrap_or(true);
+            if stale_profile {
+                if let Some(token) = &token {
+                    if let Ok(fresh) =
+                        profile_api::fetch_profile(&client, &config.base_url, token).await
+                    {
+                        let _ = cache::save_profile(&cache_dir, &fresh);
+                        profile_fetched_at = Some(Utc::now());
+                        profile = Some(fresh);
+                    }
+                }
+            }
+
             match decide(&result, &mut backoff, &mut auth) {
                 Decision::RetryAuthOnce => continue,
                 Decision::Publish => {
@@ -215,22 +244,6 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                         stale: false,
                     };
                     let _ = cache::save_snapshot(&cache_dir, &snapshot);
-
-                    // The plan changes a few times a year at most (spec §4.5).
-                    let stale_profile = profile_fetched_at
-                        .map(|at| Utc::now() - at > ChronoDuration::hours(PROFILE_MAX_AGE_HOURS))
-                        .unwrap_or(true);
-                    if stale_profile {
-                        if let Some(token) = &token {
-                            if let Ok(fresh) =
-                                profile_api::fetch_profile(&client, &config.base_url, token).await
-                            {
-                                let _ = cache::save_profile(&cache_dir, &fresh);
-                                profile_fetched_at = Some(Utc::now());
-                                profile = Some(fresh);
-                            }
-                        }
-                    }
 
                     crate::tray::apply(&app, &snapshot);
 
@@ -270,13 +283,45 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
             }
 
             let interval = Duration::from_secs(crate::settings::load(&app).poll_interval_secs);
-            let delay = backoff.next_delay(interval);
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = signal.notified() => {}
-            }
+            let deadline = tokio::time::Instant::now() + backoff.next_delay(interval);
+            wait_for_next_poll(deadline, &signal, &backoff).await;
         }
     });
+}
+
+/// Waits until `deadline`, unless a manual refresh (menu item, refresh
+/// button, popover opening) arrives first — except while `backoff` is active.
+/// A backoff exists to buy the endpoint a quiet period; `toggle_popover`
+/// fires a refresh on every panel open, so a worried user checking the panel
+/// repeatedly while rate-limited must not be able to redeliver a request every
+/// time, or the quiet period never happens and the backoff can never
+/// escalate to where it would help. Outside a backoff, a refresh still cuts
+/// the wait short as before.
+///
+/// `deadline` is a fixed `Instant`, computed once by the caller, so re-running
+/// `sleep_until` on every loop iteration below still targets the same point
+/// in time rather than restarting the wait. A refresh signal that arrived
+/// before this function was even called — while the previous poll was still
+/// in flight — is handled the same way: `Notify` delivers at most one stored
+/// wake per call to `notified()`, so the first iteration below consumes it,
+/// checks the (already-decided) backoff state, and either honours it or
+/// discards it and re-arms `notified()` for a genuinely new signal.
+async fn wait_for_next_poll(
+    deadline: tokio::time::Instant,
+    signal: &RefreshSignal,
+    backoff: &Backoff,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = signal.notified() => {
+                if backoff.is_backing_off() {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
 }
 
 fn emit(app: &AppHandle, snapshot: &UsageSnapshot, profile: &Option<Profile>, signed_out: bool) {
@@ -324,6 +369,23 @@ mod tests {
         backoff.on_rate_limited();
         backoff.on_success();
         assert_eq!(backoff.next_delay(BASE), BASE);
+    }
+
+    /// Pinned across the full escalate/reset cycle, not just the endpoints:
+    /// a fresh `Backoff` is not active, one rate limit starts it, a second
+    /// consecutive one leaves it active rather than toggling it, and a
+    /// success clears it. `wait_for_next_poll` below trusts this predicate
+    /// with the decision of whether a refresh may cut its wait short.
+    #[test]
+    fn is_backing_off_reflects_the_escalate_reset_cycle() {
+        let mut backoff = Backoff::new();
+        assert!(!backoff.is_backing_off(), "a fresh backoff is not active");
+        backoff.on_rate_limited();
+        assert!(backoff.is_backing_off(), "one rate limit starts it");
+        backoff.on_rate_limited();
+        assert!(backoff.is_backing_off(), "still active while escalating");
+        backoff.on_success();
+        assert!(!backoff.is_backing_off(), "a success clears it");
     }
 
     #[test]
@@ -438,5 +500,74 @@ mod tests {
         );
         assert_eq!(decision, Decision::Wait);
         assert_eq!(backoff.next_delay(BASE), BASE);
+    }
+
+    // `wait_for_next_poll` has no test-util feature available to it (the
+    // `tokio` dependency is frozen without `test-util`, so `time::pause`/
+    // `time::advance` are not options here): these two run on the real clock
+    // with short, wide-margin durations rather than a deterministic virtual
+    // one. They pin direction and rough magnitude — "did not shorten" versus
+    // "shortened by roughly this much" — not exact timing, which a loaded CI
+    // runner could never guarantee. What they cannot rule out is a shortening
+    // small enough to still pass the margin, or that `RefreshSignal`'s
+    // observable behavior under real concurrent access (task scheduling
+    // fairness, executor jitter) matches what a single-threaded reading of
+    // the code suggests it should.
+
+    /// A refresh landing partway through an active backoff must not shorten
+    /// the wait at all: the full deadline still has to elapse.
+    #[tokio::test]
+    async fn a_refresh_during_backoff_does_not_shorten_the_wait() {
+        let mut backoff = Backoff::new();
+        backoff.on_rate_limited();
+        let signal = RefreshSignal::default();
+        let wait = std::time::Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now() + wait;
+
+        let started = std::time::Instant::now();
+        tokio::join!(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(
+                    signal.request(),
+                    "the first-ever refresh is never throttled"
+                );
+            },
+            wait_for_next_poll(deadline, &signal, &backoff),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(230),
+            "a refresh during an active backoff must not cut the wait short, elapsed = {elapsed:?}"
+        );
+    }
+
+    /// The same refresh, outside a backoff, must cut an ordinary wait short
+    /// rather than making it run to the full deadline.
+    #[tokio::test]
+    async fn a_refresh_outside_backoff_cuts_the_wait_short() {
+        let backoff = Backoff::new();
+        let signal = RefreshSignal::default();
+        let wait = std::time::Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now() + wait;
+
+        let started = std::time::Instant::now();
+        tokio::join!(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(
+                    signal.request(),
+                    "the first-ever refresh is never throttled"
+                );
+            },
+            wait_for_next_poll(deadline, &signal, &backoff),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(125),
+            "a refresh outside a backoff should cut the wait well short of the deadline, elapsed = {elapsed:?}"
+        );
     }
 }

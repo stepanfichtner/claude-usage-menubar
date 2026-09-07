@@ -61,6 +61,24 @@
       saveError = String(e);
     }
   }
+
+  // `sanitized()` on the Rust side already sorts, deduplicates and bounds
+  // these to 1..=100 on load and on save, and empties the list whenever
+  // notifications are disabled — this only has to not fight that. It does
+  // not re-validate as the user types: a value that is momentarily out of
+  // range or duplicated while someone is mid-edit is exactly the kind of
+  // "list looks empty or wrong for a moment" state that must survive
+  // untouched rather than being "corrected" out from under them.
+  function addThreshold() {
+    if (!settings) return;
+    const highest = settings.thresholds.length ? Math.max(...settings.thresholds) : 40;
+    settings.thresholds = [...settings.thresholds, Math.min(100, highest + 10)];
+  }
+
+  function removeThreshold(index: number) {
+    if (!settings) return;
+    settings.thresholds = settings.thresholds.filter((_, i) => i !== index);
+  }
 </script>
 
 {#if loadError}
@@ -77,8 +95,39 @@
 
     <label class="check">
       <input type="checkbox" bind:checked={settings.notificationsEnabled} />
-      Notify me at {settings.thresholds.join(", ")}%
+      Notify me at these usage levels
     </label>
+
+    <div class="thresholds" class:disabled={!settings.notificationsEnabled}>
+      {#each settings.thresholds as _, i}
+        <span class="threshold">
+          <input
+            type="number"
+            min="1"
+            max="100"
+            disabled={!settings.notificationsEnabled}
+            bind:value={settings.thresholds[i]}
+          />
+          <span class="pct">%</span>
+          <button
+            type="button"
+            class="remove"
+            disabled={!settings.notificationsEnabled}
+            onclick={() => removeThreshold(i)}
+            aria-label="Remove threshold"
+          >&times;</button>
+        </span>
+      {/each}
+      {#if settings.thresholds.length === 0}
+        <span class="waiting">No thresholds set</span>
+      {/if}
+      <button
+        type="button"
+        class="add"
+        disabled={!settings.notificationsEnabled}
+        onclick={addThreshold}
+      >+ Add</button>
+    </div>
 
     <label class="check">
       <input type="checkbox" bind:checked={settings.launchAtLogin} />
@@ -128,6 +177,39 @@
     white-space: nowrap;
   }
   .waiting { color: var(--fg-muted); font-size: 12px; margin: 4px 0; }
+  .thresholds {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: -2px 0 2px 24px;
+  }
+  .thresholds.disabled { opacity: 0.5; }
+  .threshold {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px 4px 2px 8px;
+  }
+  .threshold input[type="number"] { width: 44px; }
+  .threshold .pct { color: var(--fg-muted); font-size: 12px; }
+  .threshold .remove,
+  .add {
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    cursor: pointer;
+    border-radius: 5px;
+    padding: 2px 6px;
+    font: inherit;
+  }
+  .threshold .remove:hover,
+  .add:hover:not(:disabled) { color: var(--fg); background: var(--hover); }
+  .add { border: 1px dashed var(--border); }
+  .threshold .remove:disabled,
+  .add:disabled { cursor: default; }
   footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .ok { color: var(--normal); font-size: 12px; }
   .error { color: var(--critical); font-size: 12px; }

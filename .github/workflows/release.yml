@@ -60,6 +60,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -85,6 +87,35 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      # Spec §13.2: no hand-maintained changelog. `${GITHUB_REF_NAME}^` is the
+      # parent of the just-pushed tag's commit, so this names the tag before
+      # it in the tag's own ancestry rather than just the newest other tag —
+      # right even with tags out of creation order. On the very first release
+      # that parent has no reachable tag at all, `git describe` fails, and
+      # `|| true` (with `set -e` in effect on this shell) turns that into an
+      # empty PREVIOUS_TAG rather than a failed step; RANGE then falls back to
+      # the tag alone, i.e. the whole history up to it.
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RANGE="$PREVIOUS_TAG..$GITHUB_REF_NAME"
+          else
+            RANGE="$GITHUB_REF_NAME"
+          fi
+          NOTES=$(git log "$RANGE" --no-merges --pretty=format:'- %s' \
+            | grep -E '^- (feat|fix)(\([^)]*\))?:' || true)
+          {
+            echo "notes<<NOTES_EOF"
+            if [ -n "$NOTES" ]; then
+              echo "$NOTES"
+            else
+              echo "No feat/fix commits since the previous release."
+            fi
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,6 +127,8 @@ jobs:
           releaseBody: |
             Unsigned builds. On macOS, right-click the app and choose Open, or run
             `xattr -dr com.apple.quarantine "/Applications/Claude Usage.app"`.
+
+            ${{ steps.notes.outputs.notes }}
           releaseDraft: true
           includeUpdaterJson: true
           args: ${{ matrix.args }}
