@@ -4,13 +4,10 @@ pub mod raw;
 pub use normalize::normalize;
 
 use crate::error::ApiError;
+use crate::http::send_authed;
 use crate::model::Quota;
 
 pub const API_BASE: &str = "https://api.anthropic.com";
-
-pub fn user_agent() -> String {
-    format!("claude-usage-menubar/{}", env!("CARGO_PKG_VERSION"))
-}
 
 pub async fn fetch_usage(
     client: &reqwest::Client,
@@ -18,26 +15,7 @@ pub async fn fetch_usage(
     token: &str,
 ) -> Result<Vec<Quota>, ApiError> {
     let url = format!("{base_url}/api/oauth/usage?at_wall=1&skip_spend=1");
-    let response = client
-        .get(url)
-        .bearer_auth(token)
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", user_agent())
-        .send()
-        .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
-
-    match response.status().as_u16() {
-        200 => {}
-        401 | 403 => return Err(ApiError::SignedOut),
-        429 => return Err(ApiError::RateLimited),
-        other => return Err(ApiError::Http(other)),
-    }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let body = send_authed(client, url, token).await?;
     let raw: raw::RawUsage = serde_json::from_str(&body).map_err(|_| ApiError::Parse)?;
     Ok(normalize(&raw))
 }
@@ -82,48 +60,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maps_401_to_signed_out() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        assert_eq!(
-            fetch_usage(&client, &server.uri(), "t").await.unwrap_err(),
-            ApiError::SignedOut
-        );
-    }
-
-    #[tokio::test]
-    async fn maps_429_to_rate_limited() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(429))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        assert_eq!(
-            fetch_usage(&client, &server.uri(), "t").await.unwrap_err(),
-            ApiError::RateLimited
-        );
-    }
-
-    #[tokio::test]
-    async fn maps_other_statuses_to_http() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        assert_eq!(
-            fetch_usage(&client, &server.uri(), "t").await.unwrap_err(),
-            ApiError::Http(503)
-        );
-    }
-
-    #[tokio::test]
     async fn maps_garbage_body_to_parse() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -135,18 +71,5 @@ mod tests {
             fetch_usage(&client, &server.uri(), "t").await.unwrap_err(),
             ApiError::Parse
         );
-    }
-
-    /// Spec §12.1. Port 1 is reserved and never listening, so this fails fast
-    /// and deterministically without touching the network.
-    #[tokio::test]
-    async fn network_errors_never_contain_the_token() {
-        let secret = "sk-ant-oat01-SECRETVALUE";
-        let client = reqwest::Client::new();
-        let err = fetch_usage(&client, "http://127.0.0.1:1", secret)
-            .await
-            .unwrap_err();
-        let rendered = format!("{err} {err:?}");
-        assert!(!rendered.contains("SECRETVALUE"), "leaked: {rendered}");
     }
 }

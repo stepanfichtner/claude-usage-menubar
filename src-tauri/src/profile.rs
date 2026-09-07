@@ -1,8 +1,8 @@
 use serde::Deserialize;
 
 use crate::error::ApiError;
+use crate::http::send_authed;
 use crate::model::Profile;
-use crate::usage::user_agent;
 
 #[derive(Deserialize)]
 struct RawProfile {
@@ -57,26 +57,8 @@ pub async fn fetch_profile(
     base_url: &str,
     token: &str,
 ) -> Result<Profile, ApiError> {
-    let response = client
-        .get(format!("{base_url}/api/oauth/profile"))
-        .bearer_auth(token)
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", user_agent())
-        .send()
-        .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
-
-    match response.status().as_u16() {
-        200 => {}
-        401 | 403 => return Err(ApiError::SignedOut),
-        429 => return Err(ApiError::RateLimited),
-        other => return Err(ApiError::Http(other)),
-    }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let url = format!("{base_url}/api/oauth/profile");
+    let body = send_authed(client, url, token).await?;
     let raw: RawProfile = serde_json::from_str(&body).map_err(|_| ApiError::Parse)?;
 
     Ok(Profile {
@@ -88,7 +70,7 @@ pub async fn fetch_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -116,6 +98,42 @@ mod tests {
     #[test]
     fn a_word_ending_in_x_that_is_not_a_multiplier_is_untouched() {
         assert_eq!(plan_label("default_claude_linux"), "Claude Linux");
+    }
+
+    #[tokio::test]
+    async fn sends_the_expected_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/profile"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(header("anthropic-beta", "oauth-2025-04-20"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"account":{},"organization":{}}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        fetch_profile(&client, &server.uri(), "test-token")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn maps_garbage_body_to_parse() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html>", "text/html"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            fetch_profile(&client, &server.uri(), "t")
+                .await
+                .unwrap_err(),
+            ApiError::Parse
+        );
     }
 
     #[tokio::test]
