@@ -205,15 +205,20 @@ pub fn spawn_check(app: AppHandle) {
             status.set_done(outcome.clone());
         }
         crate::tray::refresh_menu(&app);
-        notify(&app, &outcome);
+        notify(
+            &app,
+            &outcome,
+            crate::settings::load(&app).notifications_enabled,
+        );
         if let CheckOutcome::Installing { .. } = outcome {
             app.restart();
         }
     });
 }
 
-/// Shows a best-effort system notification for `outcome`, and echoes the
-/// same text onto the tray icon's tooltip — both courtesies on top of the
+/// Shows a best-effort system notification for `outcome`, if the user's
+/// `notifications_enabled` setting allows it, and echoes the same text onto
+/// the tray icon's tooltip. Both are courtesies on top of the
 /// real channel, which is the `Check for Updates…` menu label
 /// (`UpdateCheckStatus`, already rebuilt into the menu via
 /// `tray::refresh_menu` by the time `spawn_check` calls this). Neither call
@@ -225,14 +230,26 @@ pub fn spawn_check(app: AppHandle) {
 /// `tray-icon-0.24.2/src/platform_impl/gtk/mod.rs`, whose `set_tooltip`
 /// always returns `Ok(())` without doing anything); on macOS it genuinely
 /// sets the native tooltip.
-fn notify(app: &AppHandle, outcome: &CheckOutcome) {
+fn notify<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    outcome: &CheckOutcome,
+    notifications_enabled: bool,
+) {
     let (title, body) = outcome.notification();
-    let _ = app
-        .notification()
-        .builder()
-        .title(title.clone())
-        .body(body.clone())
-        .show();
+    // One switch, honoured the same way the poller honours it: with
+    // notifications off, nothing is posted to the OS from here either. Only
+    // this call is gated — the menu label is the channel this feature depends
+    // on and stays unconditional, and so does the tooltip echo below, which
+    // is part of the tray this app draws rather than something handed to a
+    // notification daemon.
+    if notifications_enabled {
+        let _ = app
+            .notification()
+            .builder()
+            .title(title.clone())
+            .body(body.clone())
+            .show();
+    }
     if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip_line(&title, &body)));
     }
@@ -340,6 +357,38 @@ mod tests {
             .build(context)
             .expect("failed to build mock app with the updater plugin registered");
         assert!(app.handle().updater().is_ok());
+    }
+
+    /// The `notifications_enabled` switch is one switch: the poller honours
+    /// it (`settings::sanitized()` clears the thresholds it evaluates
+    /// against), so a user who turned notifications off must not still get
+    /// update banners from here.
+    ///
+    /// Testable because this mock app has no notification plugin registered,
+    /// and `app.notification()` panics in that case ("state() called before
+    /// manage()"). Reaching the notification at all is therefore observable,
+    /// which is what lets this test fail — see the twin below, which asserts
+    /// that the very same call does reach it when the setting is on. The
+    /// delivery of a notification that *is* posted stays untestable for the
+    /// reasons the module doc comment gives.
+    #[test]
+    fn the_system_notification_is_suppressed_when_notifications_are_off() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        notify(app.handle(), &CheckOutcome::UpToDate, false);
+    }
+
+    /// The other half: with notifications on, `notify` still goes to the
+    /// notification plugin. Without this, a `notify` that had quietly stopped
+    /// notifying anyone at all would pass the test above.
+    #[test]
+    #[should_panic(expected = "state() called before manage()")]
+    fn the_system_notification_is_attempted_when_notifications_are_on() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        notify(app.handle(), &CheckOutcome::UpToDate, true);
     }
 
     #[test]

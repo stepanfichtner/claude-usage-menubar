@@ -118,9 +118,10 @@ channel this feature depends on** — it is the one thing here that this app
 fully controls, so it is where the outcome reliably shows up, immediately,
 without waiting for anything else to happen in the background.
 
-The app also tries to show a system notification with the same outcome, and
-echoes it onto the tray icon's tooltip too, but both are courtesies on top of
-the label, not something to rely on instead of it: the notification plugin
+The app also tries to show a system notification with the same outcome —
+unless you have turned notifications off in Settings, which silences this one
+too — and echoes it onto the tray icon's tooltip, but both are courtesies on
+top of the label, not something to rely on instead of it: the notification plugin
 this app uses cannot report whether a notification was ever actually
 displayed (notification permission can be revoked, or a minimal Linux
 desktop may have no notification daemon at all, and either way the call
