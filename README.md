@@ -8,7 +8,9 @@ The limits are account-wide, so one glance covers every Claude Code project and
 the Claude desktop app at once. That is the whole reason it exists: running several
 projects plus the desktop app, there is otherwise nowhere to see the total.
 
-macOS and Ubuntu, one codebase.
+macOS today. The codebase already builds and passes its tests on Ubuntu in CI,
+but 0.1.0 ships macOS only — nobody has run it on real Linux hardware yet. See
+the Ubuntu section below.
 
 ## What it shows
 
@@ -81,20 +83,20 @@ reading it is the whole point of the app.
 
 ### Ubuntu
 
-Download the `.deb` from [Releases](../../releases):
+Not published. The Linux build compiles and its full test suite passes in CI
+on every push (see `ci.yml`), but no one has run it on real Ubuntu hardware,
+so 0.1.0 does not include a `.deb` or an AppImage.
 
-```bash
-sudo apt install ./claude-usage_*_amd64.deb
-```
+The specific risk, not just an unticked checkbox: on macOS this app reads the
+OAuth token from the Keychain. On Linux it instead reads
+`~/.claude/.credentials.json` directly — a path that was never confirmed
+against a real Claude Code installation. If that assumption is wrong, the app
+cannot sign in at all, and that would only surface on hardware nobody here has.
 
-Or use the AppImage. On stock GNOME the tray needs the AppIndicator extension,
-which Ubuntu ships and enables by default:
-
-```bash
-sudo apt install gnome-shell-extension-appindicator
-```
-
-Log out and back in if the icon does not appear.
+If you want to try it, build from source (below) and run it on Ubuntu. A
+report back — it started, it read your credentials, the tray icon appeared,
+notifications fired — is what brings the `ubuntu-22.04` leg back to the
+release workflow.
 
 ## Updating
 
@@ -146,6 +148,15 @@ sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
   patchelf build-essential curl wget file libxdo-dev libssl-dev
 ```
 
+On stock GNOME the tray needs the AppIndicator extension, which Ubuntu ships
+and enables by default:
+
+```bash
+sudo apt install gnome-shell-extension-appindicator
+```
+
+Log out and back in if the icon does not appear.
+
 The tray icons are generated, not hand-drawn — `python3 scripts/generate-tray-icons.py`
 regenerates all five from the colour table at the top of that file. No image library
 needed.
@@ -179,9 +190,11 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` refuses the tag unless it is on `main` and
-matches `Cargo.toml`, then builds macOS (universal `.dmg` + `.app`) and Ubuntu
-(`.deb` + AppImage), and publishes a draft GitHub release with `latest.json`
-for the in-app updater attached.
+matches `Cargo.toml`, then builds macOS (universal `.dmg` + `.app`) and
+publishes a draft GitHub release with `latest.json` for the in-app updater
+attached. The Ubuntu leg is disabled for 0.1.0 — see the Ubuntu section under
+Install — and returns to this workflow once someone has verified the Linux
+build on real hardware.
 
 **If the macOS build job fails**, it is almost certainly the same `create-dmg`
 race described above ("If the DMG step fails"), now hitting the build job's
