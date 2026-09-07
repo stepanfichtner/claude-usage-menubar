@@ -296,6 +296,18 @@ mod tests {
     }
 
     #[test]
+    fn compact_countdown_switches_from_minutes_to_hours_at_exactly_sixty() {
+        assert_eq!(
+            format_compact(now() + chrono::Duration::minutes(59), now()),
+            "59m"
+        );
+        assert_eq!(
+            format_compact(now() + chrono::Duration::minutes(60), now()),
+            "1h"
+        );
+    }
+
+    #[test]
     fn compact_countdown_uses_whole_hours_under_a_day() {
         assert_eq!(
             format_compact(now() + chrono::Duration::minutes(238), now()),
@@ -431,6 +443,20 @@ mod tests {
         assert_eq!(
             IconKind::for_quotas(&[quota("a", 10.0, 60)]),
             IconKind::Normal
+        );
+    }
+
+    #[test]
+    fn the_icon_follows_the_worst_quota_regardless_of_order() {
+        // Worse quota first: distinguishes .max() from .last().
+        assert_eq!(
+            IconKind::for_quotas(&[quota("a", 95.0, 60), quota("b", 10.0, 60)]),
+            IconKind::Critical
+        );
+        // Worse quota last: distinguishes .max() from .first().
+        assert_eq!(
+            IconKind::for_quotas(&[quota("a", 10.0, 60), quota("b", 95.0, 60)]),
+            IconKind::Critical
         );
     }
 

@@ -184,6 +184,7 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         let mut profile = cache::load_profile(&cache_dir).map(|(p, _)| p);
         let mut profile_fetched_at = cache::load_profile(&cache_dir).map(|(_, at)| at);
         if let Some(cached) = cache::load_snapshot(&cache_dir) {
+            crate::tray::apply(&app, &cached);
             emit(&app, &cached, &profile, false);
         }
 
