@@ -35,6 +35,16 @@ jobs:
             exit 1
           fi
 
+  # macOS bundling has a known ~6% flake: `pnpm tauri build` can fail partway
+  # through, after the .app is already built, with a Finder/AppleScript error
+  # from the vendored `create-dmg` step (something like `Can't get disk ...
+  # (-1728)`). Root cause: that script styles the mounted disk image's window
+  # with `osascript` and occasionally runs it before Finder has caught up
+  # with the just-attached volume — a race in `create-dmg`, not in this
+  # project's code (see README's "If the DMG step fails"). It affects only
+  # the human-facing .dmg; the updater fetches the .app.tar.gz + signature,
+  # never the .dmg, so this can never break an update. If the macOS job goes
+  # red here, re-run just that job — it is not a regression.
   build:
     needs: guard
     strategy:
@@ -78,6 +88,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Claude Usage ${{ github.ref_name }}
@@ -85,4 +97,5 @@ jobs:
             Unsigned builds. On macOS, right-click the app and choose Open, or run
             `xattr -dr com.apple.quarantine "/Applications/Claude Usage.app"`.
           releaseDraft: true
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

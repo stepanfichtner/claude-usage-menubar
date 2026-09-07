@@ -45,5 +45,13 @@
     "targets": ["dmg", "app", "deb", "appimage"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.ico"],
     "linux": { "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] } }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY4RTMyNTcxNThDNkM0Q0IKUldUTHhNWlljU1hqK0MrSnVEeVl2ODd3SkVpQm9hVWgzMk1OeUlaU2s4Z0F3VVBlV0dyaG8wTksK",
+      "endpoints": [
+        "https://github.com/stepanfichtner/claude-usage-menubar/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

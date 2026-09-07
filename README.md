@@ -43,14 +43,19 @@ shows the last known figures and a message rather than crashing.
 
 ## What leaves your machine
 
-Two requests, both to `api.anthropic.com`, both authenticated with the OAuth
-token Claude Code already stored when you signed in:
+Three kinds of outbound request, and nothing else:
 
-- `GET /api/oauth/usage` — your limit percentages and reset times
-- `GET /api/oauth/profile` — your account display name and subscription tier
+- `GET /api/oauth/usage` — to `api.anthropic.com`, authenticated with the OAuth
+  token Claude Code already stored when you signed in. Your limit percentages
+  and reset times.
+- `GET /api/oauth/profile` — to `api.anthropic.com`, the same token. Your
+  account display name and subscription tier.
+- The update check — to GitHub's release assets, unauthenticated. Only when
+  you choose **Check for Updates…** from the tray menu; never automatically,
+  and never on launch.
 
-Nothing else. No telemetry, no crash reporting, no update check, no third-party
-service. The app never writes to `~/.claude/` and never modifies your Keychain.
+No telemetry, no crash reporting, no other third-party service. The app never
+writes to `~/.claude/` and never modifies your Keychain.
 
 From the profile response only the display name and the rate-limit tier are read;
 the full name, email address and account identifiers in that response are never
@@ -92,6 +97,12 @@ sudo apt install gnome-shell-extension-appindicator
 Log out and back in if the icon does not appear.
 
 ## Updating
+
+If you installed a release build, choose **Check for Updates…** from the tray
+menu. It downloads and installs any newer release and restarts the app; if the
+check fails or none is available, it says so rather than doing nothing.
+
+If you're running from a source checkout instead:
 
 ```bash
 git pull && pnpm run reinstall
@@ -139,6 +150,38 @@ The `.app` bundle is unaffected and already usable at that point; re-running
 already accounts for this: it treats a non-zero exit from `tauri build` as
 non-fatal and checks for the `.app` directly rather than trusting the exit
 code.
+
+## Releasing
+
+Bump the version in `src-tauri/Cargo.toml` (the single source of truth —
+`tauri.conf.json` inherits it), merge to `main`, then tag and push:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` refuses the tag unless it is on `main` and
+matches `Cargo.toml`, then builds macOS (universal `.dmg` + `.app`) and Ubuntu
+(`.deb` + AppImage), and publishes a draft GitHub release with `latest.json`
+for the in-app updater attached.
+
+**If the macOS build job fails**, it is almost certainly the same `create-dmg`
+race described above ("If the DMG step fails"), now hitting the build job's
+first-ever real run instead of a local one. It affects only the human-facing
+`.dmg` — the updater fetches the `.app.tar.gz` and its signature, never the
+`.dmg` — so it can never break an update, and it is not a sign the release
+itself is broken. Re-run just that job from the Actions tab; that is the fix,
+not a rollback.
+
+**If the signing key is ever lost** — the private half, in the
+`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository
+secrets, or its password — no future release can be signed with the public
+key already shipped in past installs. **Check for Updates…** on those installs
+will keep reporting a failure (the downloaded bundle's signature will not
+verify against the key they shipped with) rather than ever installing again,
+and every existing user has to reinstall by hand from a fresh download. There
+is no recovery short of that; treat the private key and its password with the
+same care as the OAuth token this app reads.
 
 ## Troubleshooting
 

@@ -133,7 +133,7 @@ impl IconKind {
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::model::UsageSnapshot;
 
@@ -171,7 +171,65 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn build_menu(app: &AppHandle, labels: &[String]) -> tauri::Result<Menu<Wry>> {
+/// One row below the quota list. Kept as data — rather than inlined
+/// `menu.append` calls — so the ids, labels and enabled state can be
+/// asserted in a plain unit test: `muda` (the native menu backend) refuses
+/// to construct a `Menu` off the main thread, and every `#[test]` runs on a
+/// worker thread, so a test can never build the real thing on macOS.
+enum MenuRow {
+    Item {
+        id: &'static str,
+        label: String,
+        enabled: bool,
+    },
+    Separator,
+}
+
+/// Every row below the quota list, in order. `build_menu` renders exactly
+/// this list, so a unit test asserting against it is asserting against what
+/// actually ships, not a description that could drift from it.
+fn trailing_rows() -> Vec<MenuRow> {
+    use MenuRow::{Item, Separator};
+    vec![
+        Item {
+            id: "open",
+            label: "Open panel".to_string(),
+            enabled: true,
+        },
+        Item {
+            id: "refresh",
+            label: "Refresh now".to_string(),
+            enabled: true,
+        },
+        Item {
+            id: "settings",
+            label: "Settings…".to_string(),
+            enabled: true,
+        },
+        Separator,
+        // Disabled: this row exists only to display the running version,
+        // the same `CARGO_PKG_VERSION` the User-Agent is built from, so
+        // there is never a question about what build is running.
+        Item {
+            id: "about",
+            label: format!("About Claude Usage (v{})", env!("CARGO_PKG_VERSION")),
+            enabled: false,
+        },
+        Item {
+            id: "check_updates",
+            label: "Check for Updates…".to_string(),
+            enabled: true,
+        },
+        Separator,
+        Item {
+            id: "quit",
+            label: "Quit".to_string(),
+            enabled: true,
+        },
+    ]
+}
+
+fn build_menu<R: Runtime>(app: &AppHandle<R>, labels: &[String]) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
     for (index, label) in labels.iter().enumerate() {
         let item = MenuItem::with_id(app, format!("quota-{index}"), label, false, None::<&str>)?;
@@ -180,29 +238,16 @@ fn build_menu(app: &AppHandle, labels: &[String]) -> tauri::Result<Menu<Wry>> {
     if !labels.is_empty() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
-    menu.append(&MenuItem::with_id(
-        app,
-        "open",
-        "Open panel",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "refresh",
-        "Refresh now",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "settings",
-        "Settings…",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?)?;
+    for row in trailing_rows() {
+        match row {
+            MenuRow::Item { id, label, enabled } => {
+                menu.append(&MenuItem::with_id(app, id, label, enabled, None::<&str>)?)?;
+            }
+            MenuRow::Separator => {
+                menu.append(&PredefinedMenuItem::separator(app)?)?;
+            }
+        }
+    }
     Ok(menu)
 }
 
@@ -280,6 +325,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 let _ = window.set_focus();
             }
         }
+        "check_updates" => crate::updater::spawn_check(app.clone()),
         "quit" => app.exit(0),
         _ => {}
     }
@@ -534,5 +580,47 @@ mod tests {
         assert!(!is_toggle_click(MouseButton::Left, MouseButtonState::Down));
         assert!(!is_toggle_click(MouseButton::Right, MouseButtonState::Up));
         assert!(!is_toggle_click(MouseButton::Middle, MouseButtonState::Up));
+    }
+
+    /// Proves the menu is wired: `About` is present, disabled, and names the
+    /// running version; `Check for Updates…` is present and enabled; both
+    /// sit above `Quit`. Asserted against `trailing_rows()` — the exact data
+    /// `build_menu` renders — rather than a live `muda::Menu`, which refuses
+    /// to build off the main thread and so cannot be constructed inside a
+    /// `#[test]` on macOS.
+    #[test]
+    fn about_and_check_for_updates_sit_above_quit() {
+        let items: Vec<(&str, String, bool)> = trailing_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                MenuRow::Item { id, label, enabled } => Some((id, label, enabled)),
+                MenuRow::Separator => None,
+            })
+            .collect();
+
+        let (_, about_label, about_enabled) = items
+            .iter()
+            .find(|(id, _, _)| *id == "about")
+            .expect("About item missing");
+        assert_eq!(
+            *about_label,
+            format!("About Claude Usage (v{})", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(
+            !about_enabled,
+            "About should be informational, not clickable"
+        );
+
+        let (_, check_label, check_enabled) = items
+            .iter()
+            .find(|(id, _, _)| *id == "check_updates")
+            .expect("Check for Updates… item missing");
+        assert_eq!(*check_label, "Check for Updates…");
+        assert!(*check_enabled);
+
+        let ids: Vec<&str> = items.iter().map(|(id, _, _)| *id).collect();
+        let position = |id: &str| ids.iter().position(|&candidate| candidate == id).unwrap();
+        assert!(position("about") < position("quit"));
+        assert!(position("check_updates") < position("quit"));
     }
 }

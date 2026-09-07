@@ -10,6 +10,7 @@ pub mod poller;
 pub mod profile;
 pub mod settings;
 pub mod tray;
+pub mod updater;
 pub mod usage;
 
 use std::sync::Arc;
@@ -98,6 +99,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(poller::RefreshSignal::default()))
         .setup(|app| {
             #[cfg(target_os = "macos")]
