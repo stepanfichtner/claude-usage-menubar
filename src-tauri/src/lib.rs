@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod credentials;
 pub mod model;
 pub mod usage;
 
