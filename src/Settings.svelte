@@ -7,6 +7,7 @@
     type Absences,
     type TitleEntry,
   } from "./lib/titleEntries";
+  import { nextThreshold } from "./lib/thresholds";
   import { renderTitle } from "./lib/titlePreview";
 
   interface Settings {
@@ -117,10 +118,15 @@
   // range or duplicated while someone is mid-edit is exactly the kind of
   // "list looks empty or wrong for a moment" state that must survive
   // untouched rather than being "corrected" out from under them.
+  // `nextThreshold` (src/lib/thresholds.ts) answers both questions the
+  // button has: what to append, and whether there is anything left to
+  // append at all. It used to return 100 a second time once 100 was set,
+  // and the UI showed the impossible duplicate row until it reloaded.
+  let proposedThreshold = $derived(settings ? nextThreshold(settings.thresholds) : null);
+
   function addThreshold() {
-    if (!settings) return;
-    const highest = settings.thresholds.length ? Math.max(...settings.thresholds) : 40;
-    settings.thresholds = [...settings.thresholds, Math.min(100, highest + 10)];
+    if (!settings || proposedThreshold === null) return;
+    settings.thresholds = [...settings.thresholds, proposedThreshold];
   }
 
   function removeThreshold(index: number) {
@@ -184,12 +190,21 @@
             {#if settings.thresholds.length === 0}
               <span class="waiting">No thresholds set</span>
             {/if}
-            <button
-              type="button"
-              class="add"
-              disabled={!settings.notificationsEnabled}
-              onclick={addThreshold}
-            >+ Add</button>
+            <span class="add-row">
+              <button
+                type="button"
+                class="add"
+                disabled={!settings.notificationsEnabled || proposedThreshold === null}
+                onclick={addThreshold}
+              >+ Add</button>
+              <!-- Says why the button is dead, rather than leaving a click do
+                   nothing. Only while notifications are on: with them off the
+                   whole block is dimmed and disabled for a different reason,
+                   and two explanations at once explains neither. -->
+              {#if settings.notificationsEnabled && proposedThreshold === null}
+                <span class="ceiling">100% is already the highest</span>
+              {/if}
+            </span>
           </div>
         </div>
 
@@ -331,6 +346,11 @@
   .add { border: 1px dashed var(--border); }
   .threshold .remove:disabled,
   .add:disabled { cursor: default; }
+  /* The button and its reason share a line: the thresholds column is a
+     narrow left-aligned stack, and a reason on its own row reads as a
+     status message about the whole list rather than about this button. */
+  .add-row { display: flex; align-items: center; gap: 8px; }
+  .ceiling { color: var(--fg-muted); font-size: 12px; }
 
   .quota-list {
     display: flex;
