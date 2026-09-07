@@ -408,6 +408,25 @@ mod tests {
         );
     }
 
+    /// These two constants are measured, not chosen, and the measurement is the
+    /// only thing that justifies them: against the live endpoint, four requests
+    /// inside ten seconds returned 429, three requests four seconds apart did
+    /// not, and recovery from a 429 took 111 seconds.
+    ///
+    /// The limit is therefore burst-sensitive rather than rate-sensitive, which
+    /// is why the throttle exists at all — 20 seconds was short enough to let a
+    /// burst form from panel opens alone. And why the backoff starts at two
+    /// minutes rather than five: the condition it answers lasts about two.
+    ///
+    /// The other throttle tests are deliberately symbolic, so this is the only
+    /// place the absolute values are pinned. Changing either constant should
+    /// mean re-measuring, not editing this test.
+    #[test]
+    fn the_measured_rate_limit_values_are_what_ship() {
+        assert_eq!(MIN_MANUAL_REFRESH_SECS, 60);
+        assert_eq!(BACKOFF_STEPS, [2 * 60, 5 * 60, 15 * 60]);
+    }
+
     #[test]
     fn a_network_error_waits_at_the_base_interval() {
         let mut backoff = Backoff::new();
