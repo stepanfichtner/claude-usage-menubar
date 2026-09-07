@@ -262,10 +262,23 @@ mod tests {
 
     #[test]
     fn the_published_list_prices_are_what_ship() {
-        for (model, input, output, write_5m, write_1h, read) in PUBLISHED {
-            let price = for_model(model).unwrap_or_else(|| panic!("{model} is not priced"));
+        // Driven from `TABLE`, not from `PUBLISHED`. The other way round, a
+        // row added to `TABLE` and forgotten here would ship with its input
+        // and output prices pinned by nothing at all —
+        // `derived_rates_follow_the_published_multipliers` only checks the
+        // cache columns against whatever base input is sitting in the row, so
+        // a wrong base input with correctly derived cache columns would pass
+        // both tests. Closing that is the whole reason `TABLE` is a slice
+        // rather than a `match`.
+        for (model, price) in TABLE {
+            let (_, input, output, write_5m, write_1h, read) = PUBLISHED
+                .iter()
+                .find(|(id, ..)| id == model)
+                .unwrap_or_else(|| {
+                    panic!("{model} is priced but not pinned — add it to PUBLISHED")
+                });
             assert_eq!(
-                price,
+                *price,
                 Price {
                     input: *input,
                     output: *output,
@@ -276,6 +289,14 @@ mod tests {
                 "{model}"
             );
         }
+        // The loop above catches a row in `TABLE` that nothing pins; this
+        // catches the reverse, a row pinned here after it was dropped from
+        // `TABLE`. Together they make the two lists the same set of models.
+        assert_eq!(
+            TABLE.len(),
+            PUBLISHED.len(),
+            "PUBLISHED pins a model that TABLE no longer prices"
+        );
     }
 
     /// The canary above pins the numbers; this pins the *relationships* the
@@ -290,11 +311,11 @@ mod tests {
     ///
     /// Compared within 1e-9 rather than exactly, because `3.0 * 0.1` is
     /// `0.30000000000000004` in binary floating point while the published
-    /// Sonnet 4.x cache read is `$0.30`. The tolerance is eight orders of
-    /// magnitude below the smallest published increment ($0.005/MTok), so it
-    /// forgives the representation and nothing else: the error this test
-    /// exists for — a $0.25 cache read where $1.00 is published — is off by
-    /// 0.75.
+    /// Sonnet 4.x cache read is `$0.30`. The tolerance sits nearly seven
+    /// orders of magnitude below the smallest published increment
+    /// ($0.005/MTok), so it forgives the representation and nothing else: the
+    /// error this test exists for — a $0.25 cache read where $1.00 is
+    /// published — is off by 0.75.
     #[test]
     fn derived_rates_follow_the_published_multipliers() {
         fn assert_rate(model: &str, column: &str, actual: f64, expected: f64) {

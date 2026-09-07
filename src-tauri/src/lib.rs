@@ -108,7 +108,19 @@ impl AnalyticsInner {
 /// tab has something to render and the setting is the only gate.
 #[tauri::command]
 async fn analytics_summary(app: tauri::AppHandle) -> Result<analytics::Summary, String> {
-    if !settings::load(&app).analytics_enabled {
+    summary_for(&app).await
+}
+
+/// The body of `analytics_summary`, generic over the Tauri runtime for the
+/// same reason `settings::load` is: a `#[tauri::command]` takes a concrete
+/// `AppHandle` (= `AppHandle<Wry>`) and needs a real webview, whereas this can
+/// be driven against `tauri::test`'s `MockRuntime`. That is what makes the
+/// `analytics_enabled` gate — the one thing standing between "off by default"
+/// and reading the user's transcripts unasked — testable at all.
+async fn summary_for<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<analytics::Summary, String> {
+    if !settings::load(app).analytics_enabled {
         return Ok(analytics::Summary::default());
     }
     let root = dirs::home_dir()
@@ -122,6 +134,7 @@ async fn analytics_summary(app: tauri::AppHandle) -> Result<analytics::Summary, 
     // hold that thread for its whole duration, and the poller shares this
     // runtime. `spawn_blocking` puts it on the pool meant for exactly this,
     // which is what keeps the panel answering while the scan runs.
+    let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         use tauri::Manager;
         let state = app.state::<AnalyticsState>();
@@ -230,6 +243,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::Manager;
 
     fn entry(request_id: &str, input: u64) -> analytics::scan::Entry {
         analytics::scan::Entry {
@@ -281,5 +295,106 @@ mod tests {
 
         assert_eq!(inner.entries.len(), 2);
         assert_eq!(analytics::summarize(&inner.entries).total_tokens, 30);
+    }
+
+    /// Scoped `HOME` plus a `MockRuntime` app with the real store plugin, the
+    /// same pairing `settings::tests` uses. Both helpers come from there
+    /// rather than being copied, so there is one definition of what a scoped
+    /// home is, and `HomeGuard` serializes every test that overrides `HOME` —
+    /// these tests resolve `~/.claude/projects` through it.
+    fn scoped_app(
+        home: &std::path::Path,
+    ) -> (
+        settings::tests::HomeGuard,
+        tauri::App<tauri::test::MockRuntime>,
+    ) {
+        let guard = settings::tests::HomeGuard::scoped_to(home);
+        let app = settings::tests::mock_app_with_store();
+        (guard, app)
+    }
+
+    /// Writes one transcript under `<home>/.claude/projects`, exactly where
+    /// `summary_for` will look for it.
+    fn plant_transcript(home: &std::path::Path) {
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join("-Users-me-Projects-alpha");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("session.jsonl"),
+            concat!(
+                r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T12:00:00.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The gate, from the side that matters. Analytics is off by default, and
+    /// while it is off this app must not read the user's transcripts at all —
+    /// so a transcript sitting right where the scan would look must produce
+    /// the same empty summary as an empty disk.
+    ///
+    /// Nothing failed if the gate was deleted before this existed: the enabled
+    /// path returns a real summary and the disabled path was never exercised.
+    #[test]
+    fn no_transcript_is_read_while_analytics_is_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_transcript(dir.path());
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(AnalyticsState::default());
+
+        settings::save(
+            app.handle(),
+            &settings::Settings {
+                analytics_enabled: false,
+                ..settings::Settings::default()
+            },
+        )
+        .unwrap();
+
+        let summary = tauri::async_runtime::block_on(summary_for(app.handle())).unwrap();
+        assert_eq!(summary, analytics::Summary::default());
+        assert_eq!(summary.total_tokens, 0, "the transcript must not be read");
+    }
+
+    /// The other side of the same switch, which is what stops the test above
+    /// from passing against a command that always returns nothing: the very
+    /// same transcript, the very same app, analytics on.
+    ///
+    /// This is also the only test that drives the whole command path —
+    /// settings load, home resolution, `spawn_blocking`, the managed state,
+    /// the scan and the summary — rather than its pieces.
+    #[test]
+    fn switching_analytics_on_reads_the_same_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_transcript(dir.path());
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(AnalyticsState::default());
+
+        settings::save(
+            app.handle(),
+            &settings::Settings {
+                analytics_enabled: true,
+                ..settings::Settings::default()
+            },
+        )
+        .unwrap();
+
+        let summary = tauri::async_runtime::block_on(summary_for(app.handle())).unwrap();
+        assert_eq!(summary.total_tokens, 1_000_000);
+        assert_eq!(summary.by_model.len(), 1);
+        assert_eq!(summary.by_model[0].name, "claude-opus-5");
+        assert!(
+            (summary.total_cost - 5.0).abs() < 1e-9,
+            "{}",
+            summary.total_cost
+        );
+
+        // And the state really is carried across calls: a second run over an
+        // unchanged tree reads nothing new and must not double the figures.
+        let again = tauri::async_runtime::block_on(summary_for(app.handle())).unwrap();
+        assert_eq!(again.total_tokens, 1_000_000);
     }
 }

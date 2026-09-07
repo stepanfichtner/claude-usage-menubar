@@ -79,7 +79,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> Result<(), S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -196,18 +196,37 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    /// Serializes every test that overrides `HOME`.
+    ///
+    /// `HOME` is process-wide and the test harness runs tests on several
+    /// threads, so two guards alive at once would each restore the other's
+    /// temp directory. This was a latent hazard while `settings` was the only
+    /// module scoping `HOME`; it stopped being latent when
+    /// `lib::tests::analytics_summary_*` began scoping it too, because those
+    /// tests resolve `~/.claude/projects` through it.
+    ///
+    /// A poisoned lock is taken anyway: a panicking test has already failed,
+    /// and turning that into a cascade of failures in unrelated tests would
+    /// only hide which one broke.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Restores the previous `HOME` on drop, even if the test panics, so one
-    /// test's temp-directory override can never leak into another. Nothing
-    /// else in this crate's test suite reads `HOME` (only
-    /// `credentials::read_raw`'s non-macOS path does, and its tests never call
-    /// it), so serial access to the env var is not a concern here.
-    struct HomeGuard(Option<std::ffi::OsString>);
+    /// test's temp-directory override can never leak into another, and holds
+    /// `HOME_LOCK` for its lifetime so no two overrides overlap.
+    ///
+    /// `Drop::drop` runs before the struct's fields are dropped, so `HOME` is
+    /// always restored before the lock is released.
+    pub(crate) struct HomeGuard(
+        Option<std::ffi::OsString>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
 
     impl HomeGuard {
-        fn scoped_to(dir: &std::path::Path) -> Self {
+        pub(crate) fn scoped_to(dir: &std::path::Path) -> Self {
+            let lock = HOME_LOCK.lock().unwrap_or_else(|held| held.into_inner());
             let previous = std::env::var_os("HOME");
             std::env::set_var("HOME", dir);
-            Self(previous)
+            Self(previous, lock)
         }
     }
 
@@ -224,7 +243,7 @@ mod tests {
     /// registered — not a hand-rolled substitute. Call this only after
     /// scoping `HOME` (see `HomeGuard`), so its resolved app-data directory
     /// can never land in a real one.
-    fn mock_app_with_store() -> tauri::App<tauri::test::MockRuntime> {
+    pub(crate) fn mock_app_with_store() -> tauri::App<tauri::test::MockRuntime> {
         tauri::test::mock_builder()
             .plugin(tauri_plugin_store::Builder::new().build())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
