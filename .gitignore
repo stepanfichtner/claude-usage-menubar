@@ -7,6 +7,9 @@ docs/
 /src-tauri/target/
 /src-tauri/gen/
 
+# Python (scripts/generate-tray-icons.py)
+__pycache__/
+
 # Node
 node_modules/
 dist/

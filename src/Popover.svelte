@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import SettingsIcon from "@lucide/svelte/icons/settings";
   import Callout from "./lib/Callout.svelte";
@@ -9,6 +10,30 @@
   import { now, snapshot } from "./lib/stores";
 
   const STALE_WARNING_SECS = 5 * 60;
+
+  // The window's fixed width, matching `tauri.conf.json`'s popover window —
+  // only the height ever changes. Bounds are a sane floor/ceiling so a
+  // pathological snapshot (zero quotas, or fifty of them) can't produce an
+  // unusably short or absurdly tall window; ordinary quota counts (1-6ish)
+  // land well inside this range, and `overflow-y: auto` on `main` below is
+  // the fallback if a real one ever doesn't.
+  const PANEL_WIDTH = 320;
+  const MIN_HEIGHT = 140;
+  const MAX_HEIGHT = 720;
+
+  // Outside a real Tauri webview — this component mounted in a plain browser
+  // for headless verification, say — `getCurrentWindow()` throws
+  // synchronously (it reads `window.__TAURI_INTERNALS__`, which only exists
+  // inside an actual Tauri window). There's no OS window to resize in that
+  // case, so treat it as "don't try to resize," not a crash.
+  let tauriWindow: ReturnType<typeof getCurrentWindow> | null = null;
+  try {
+    tauriWindow = getCurrentWindow();
+  } catch {
+    tauriWindow = null;
+  }
+
+  let mainEl: HTMLElement | undefined = $state();
 
   // `stale` means "no live fetch has succeeded since launch" — true only for
   // the cached snapshot served at cold start, before the first live poll
@@ -52,9 +77,39 @@
   const quotas = $derived($snapshot?.snapshot.quotas ?? []);
   const session = $derived(quotas.find((q) => q.id === "session") ?? null);
   const rings = $derived(quotas.filter((q) => q.id !== "session"));
+
+  // The quota count comes from the server (`limits[]`), so a fixed window
+  // height either wastes space (one quota) or clips the session card and
+  // footer below the fold (several) — a fixed-size window can't be right for
+  // content whose size we don't control. Resize to fit instead, whenever the
+  // content changes.
+  //
+  // Measuring `mainEl.scrollHeight` rather than `document.body.scrollHeight`
+  // matters here — and specifically must not be measured on an element with
+  // a *fixed* `height` (a first attempt at this used `height: 100vh` on
+  // `main` and measured from there: `scrollHeight` is `max(own set height,
+  // content height)`, so it silently floored every measurement at the
+  // window's current height and could shrink to fit but never grow, nor
+  // shrink below whatever height the window already happened to be). `main`
+  // below uses `max-height: 100vh` instead — a ceiling, not a fixed size —
+  // so it sizes to its content in both directions, and `scrollHeight`
+  // reports that true content height, only bottoming out at `max-height`
+  // once content genuinely exceeds it (see the stylesheet below).
+  $effect(() => {
+    void $snapshot; // re-measure whenever the content changes
+    if (!tauriWindow) return;
+    requestAnimationFrame(() => {
+      if (!mainEl) return;
+      const height = Math.min(
+        MAX_HEIGHT,
+        Math.max(MIN_HEIGHT, Math.ceil(mainEl.scrollHeight)),
+      );
+      tauriWindow!.setSize(new LogicalSize(PANEL_WIDTH, height)).catch(() => {});
+    });
+  });
 </script>
 
-<main>
+<main bind:this={mainEl}>
   <header>
     <div class="who">
       <div class="name">{$snapshot?.profile?.displayName ?? "Claude usage"}</div>
@@ -106,7 +161,14 @@
     backdrop-filter: blur(30px);
     border-radius: 12px;
     padding: 6px;
-    height: 100vh;
+    /* Not `height: 100vh` — that would force `main.scrollHeight` (what the
+       resize effect above measures) to bottom out at the *current* window
+       height even when the content is shorter, since `scrollHeight` is
+       max(own set height, content height). Left to size naturally, it
+       reports the true content height in both directions; `max-height` is
+       purely a fallback so content can never render taller than the OS
+       window if a resize is ever denied or hasn't landed yet. */
+    max-height: 100vh;
     overflow-y: auto;
   }
   header {

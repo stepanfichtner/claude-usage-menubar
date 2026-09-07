@@ -134,6 +134,12 @@ mod tests {
         assert_eq!(ids, vec!["session", "weekly_all", "weekly:Opus"]);
         assert_eq!(quotas[0].percent, 41.5);
         assert_eq!(quotas[2].percent, 12.0);
+        // The legacy path renames its labels to the same family as
+        // `from_limit` — unguarded until now, so a revert of either would
+        // have passed silently.
+        assert_eq!(quotas[0].label, "Current session");
+        assert_eq!(quotas[1].label, "This week");
+        assert_eq!(quotas[2].label, "Opus this week");
     }
 
     #[test]

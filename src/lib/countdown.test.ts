@@ -24,6 +24,14 @@ describe("formatLong", () => {
     expect(formatLong(ahead(60), now)).toBe("1h 0m");
   });
 
+  it("switches from hours to days at exactly twenty-four hours", () => {
+    // Mirrors `compact_countdown_uses_days_and_hours_beyond_that` in the Rust
+    // crate — pinned there for `format_compact` at the exact minute-1440
+    // transition, but never pinned here for `formatLong` until now.
+    expect(formatLong(ahead(23 * 60 + 59), now)).toBe("23h 59m");
+    expect(formatLong(ahead(24 * 60), now)).toBe("1d 0h");
+  });
+
   it("uses days and hours beyond that", () => {
     expect(formatLong(ahead(2 * 24 * 60 + 13 * 60), now)).toBe("2d 13h");
     expect(formatLong(ahead(6 * 24 * 60), now)).toBe("6d 0h");
@@ -58,6 +66,13 @@ describe("formatCompact", () => {
   it("uses hours and minutes under a day", () => {
     expect(formatCompact(ahead(238), now)).toBe("3h58m");
     expect(formatCompact(ahead(23 * 60), now)).toBe("23h0m");
+  });
+
+  it("switches from hours to days at exactly twenty-four hours", () => {
+    // Mirrors `compact_countdown_uses_days_and_hours_beyond_that` in the Rust
+    // crate at the exact minute-1440 transition.
+    expect(formatCompact(ahead(23 * 60 + 59), now)).toBe("23h59m");
+    expect(formatCompact(ahead(24 * 60), now)).toBe("1d0h");
   });
 
   it("uses days and hours beyond that", () => {
