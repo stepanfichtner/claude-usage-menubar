@@ -502,6 +502,26 @@ mod tests {
         );
     }
 
+    /// The other half of the mirror. `src/lib/countdown.test.ts` pins
+    /// `formatLong` at 59 and 60 minutes; until now the Rust side pinned that
+    /// boundary for `format_compact` only, so the two implementations were
+    /// held to the same rule — `<` vs `<=` on the hour, and whether the hours
+    /// branch keeps its minutes — on one side and not the other.
+    /// `the_long_countdown_keeps_the_smaller_unit` above uses 45 and 238
+    /// minutes, both well inside their branches, and passes unchanged against
+    /// a `minutes <= 60`.
+    #[test]
+    fn the_long_countdown_switches_from_minutes_to_hours_at_exactly_sixty() {
+        assert_eq!(
+            format_long(now() + chrono::Duration::minutes(59), now()),
+            "59m"
+        );
+        assert_eq!(
+            format_long(now() + chrono::Duration::minutes(60), now()),
+            "1h 0m"
+        );
+    }
+
     #[test]
     fn the_default_title_shows_session_and_weekly_all() {
         let quotas = vec![
