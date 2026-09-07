@@ -118,8 +118,52 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
     })
 }
 
-/// Walk `<root>/<project>/*.jsonl`, reading only what has been appended since
-/// the last call. `offsets` is the caller's persistent cursor map.
+/// Every `.jsonl` file anywhere under `dir`, sorted.
+///
+/// Sorted because `read_dir` yields in no defined order, and a scan that
+/// visits the same tree in a different order each run is a scan whose output
+/// cannot be reasoned about.
+///
+/// Iterative rather than recursive, and `DirEntry::file_type` does not follow
+/// symlinks — a symlink pointing at an ancestor is a plain file here, not a
+/// directory to descend into, so no arrangement of links can loop this.
+fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let Ok(children) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            match child.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                Ok(kind) if kind.is_file() => {
+                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        files.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Walk every `*.jsonl` under `<root>/<project>/`, reading only what has been
+/// appended since the last call. `offsets` is the caller's persistent cursor
+/// map.
+///
+/// The walk goes all the way down, not one level. Claude Code keeps a
+/// session's subagent transcripts at
+/// `<project>/<session-uuid>/subagents/*.jsonl`, which on this machine is 164
+/// of 214 files; stopping at the project directory's immediate children found
+/// 8,782 of 15,215 requests and produced an estimate low by roughly two
+/// thirds, with nothing on screen to suggest it. The project name is still
+/// the top-level directory's, however deep the file sits — a subagent's spend
+/// belongs to the project whose session ran it.
 ///
 /// Every failure is a skip, never an error: an unreadable root, an unreadable
 /// project directory, a file that vanished between listing and opening, a
@@ -133,16 +177,16 @@ pub fn scan_dir(root: &Path, offsets: &mut HashMap<PathBuf, u64>) -> Vec<Entry> 
     let Ok(projects) = std::fs::read_dir(root) else {
         return entries;
     };
-    for project_dir in projects.flatten() {
-        let project = project_dir.file_name().to_string_lossy().to_string();
-        let Ok(files) = std::fs::read_dir(project_dir.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+    let mut project_dirs: Vec<PathBuf> = projects.flatten().map(|dir| dir.path()).collect();
+    project_dirs.sort();
+
+    for project_dir in project_dirs {
+        let project = project_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        for path in jsonl_files_under(&project_dir) {
             let Ok(mut handle) = std::fs::File::open(&path) else {
                 continue;
             };
@@ -348,5 +392,49 @@ mod tests {
         assert_eq!(appended.len(), 1, "only the appended line, and it");
         assert_eq!(appended[0].request_id, "b");
         assert_eq!(appended[0].input, 2);
+    }
+
+    /// Claude Code does not keep every transcript directly under the project
+    /// directory: a session's subagent transcripts live at
+    /// `<project>/<session-uuid>/subagents/*.jsonl`. On this machine that is
+    /// 164 of 214 files — reading only the project directory's immediate
+    /// children found 8,782 requests where the tree holds 15,215, and the
+    /// estimate would have been low by roughly two thirds with nothing on
+    /// screen to suggest it.
+    ///
+    /// The spend still belongs to the project the session ran in, so the
+    /// project name stays the top-level directory's however deep the file is.
+    #[test]
+    fn transcripts_nested_below_the_project_directory_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-Users-me-Projects-alpha");
+        let nested = project.join("f5c1a581-6621-46bb-b6bb-1adf4f0d41a7/subagents");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let line = |id: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","timestamp":"2026-09-07T08:00:00.000Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":{input},"output_tokens":0}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(project.join("session.jsonl"), line("top", 10)).unwrap();
+        std::fs::write(nested.join("agent.jsonl"), line("nested", 20)).unwrap();
+
+        let mut offsets = HashMap::new();
+        let mut entries = scan_dir(dir.path(), &mut offsets);
+        entries.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "the subagent transcript three levels down must be read too"
+        );
+        assert_eq!(entries[0].request_id, "nested");
+        assert_eq!(entries[0].input, 20);
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.project == "-Users-me-Projects-alpha"),
+            "a subagent's spend belongs to the project its session ran in"
+        );
     }
 }
