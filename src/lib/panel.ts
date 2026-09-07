@@ -34,9 +34,13 @@ export const MAX_HEIGHT = 720;
  * `Math.ceil` rather than round or floor: half a pixel short clips the last
  * row of content, half a pixel over is invisible.
  *
- * Note that no input can produce 0, because the floor is applied last —
- * which is what makes 0 usable as the caller's "nothing requested yet"
- * sentinel, so the first resize after launch is never mistaken for a repeat.
+ * Note that no input can produce 0: `Math.max(MIN_HEIGHT, …)` lifts every
+ * measurement to at least the floor, and the outer `Math.min` can only bring
+ * it back down as far as `MAX_HEIGHT`, so every result lands in
+ * `[MIN_HEIGHT, MAX_HEIGHT]` — while `MIN_HEIGHT <= MAX_HEIGHT`, which is the
+ * one assumption here worth saying out loud. That is what makes 0 usable as
+ * the caller's "nothing requested yet" sentinel, so the first resize after
+ * launch is never mistaken for a repeat.
  */
 export function nextPanelHeight(
   scrollHeight: number,

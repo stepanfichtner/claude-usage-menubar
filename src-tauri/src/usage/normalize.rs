@@ -146,8 +146,16 @@ mod tests {
     /// `ApiError::Parse`, so adding `deny_unknown_fields` — the ordinary
     /// reflex when tightening a parser — would blank the menu bar the day
     /// Anthropic adds a field. That is a plausible one-line change, and this
-    /// is the test that stops it: it fails on `deny_unknown_fields` anywhere
-    /// in `usage::raw`, with a message that says why the tolerance is there.
+    /// is the test that stops it: it fails on `deny_unknown_fields` on any of
+    /// the five structs in `usage::raw`, with a message that says why the
+    /// tolerance is there.
+    ///
+    /// That last claim is why `five_hour` is here carrying an unknown key of
+    /// its own even though `limits[]` wins and the legacy path never runs:
+    /// `RawWindow` is only ever reached through the top-level window keys, so
+    /// without it, hardening `RawWindow` alone passed this test and every
+    /// fixture in the crate. A payload has to exercise each struct for the
+    /// sentence above to be true of each struct.
     #[test]
     fn unknown_response_keys_are_tolerated_rather_than_rejected() {
         let raw: crate::usage::raw::RawUsage = serde_json::from_str(
@@ -155,6 +163,8 @@ mod tests {
               "nimbus_quill": { "utilization": 0.0, "resets_at": null },
               "juniper_tide": { "eligible": false },
               "member_dashboard_available": false,
+              "five_hour": { "utilization": 1, "resets_at": null,
+                             "a_key_added_next_quarter": 1 },
               "limits": [
                 { "kind": "weekly_scoped", "group": "weekly", "percent": 7,
                   "some_field_added_next_quarter": 1,
@@ -169,7 +179,11 @@ mod tests {
         );
 
         let quotas = normalize(&raw);
-        assert_eq!(quotas.len(), 1, "only limits[] may become quotas");
+        assert_eq!(
+            quotas.len(),
+            1,
+            "only limits[] may become quotas, and it wins over five_hour"
+        );
         assert_eq!(quotas[0].id, "weekly:Fable");
     }
 

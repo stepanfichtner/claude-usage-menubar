@@ -7,6 +7,15 @@ describe("nextPanelHeight", () => {
   // window. Both sides of both bounds, because a clamp written the wrong way
   // round (`Math.max(MAX, Math.min(MIN, h))`) still returns a plausible
   // number for a mid-range measurement.
+  //
+  // What this does NOT pin is the bounds' values. They are imported, so the
+  // expectations move with them; only the literals bite. `5000` catches a
+  // MAX_HEIGHT raised past it, `40` catches a MIN_HEIGHT lowered past it, and
+  // `300.2 -> 301` below catches either bound crossing 301 — but a MAX_HEIGHT
+  // moved anywhere inside 301..5000 goes unnoticed. That is deliberate: 140
+  // and 720 are a judgement about what looks right on a 320px panel, not a
+  // contract, and pinning them would only fail this test every time someone
+  // tunes the window.
   it("clamps to the panel's floor and ceiling", () => {
     expect(nextPanelHeight(40, 0)).toBe(MIN_HEIGHT);
     expect(nextPanelHeight(MIN_HEIGHT, 0)).toBe(MIN_HEIGHT);
@@ -34,10 +43,10 @@ describe("nextPanelHeight", () => {
 
   // The caller starts `lastHeight` at 0 and relies on no measurement ever
   // producing 0, or the first resize after launch would be swallowed as a
-  // repeat and the window would keep whatever size it opened at. That is only
-  // true while the floor is applied last — a clamp that let a zero
-  // measurement (content not laid out yet, `main` not yet bound) through
-  // would break it.
+  // repeat and the window would keep whatever size it opened at. That holds
+  // only while every result passes through the floor and MIN_HEIGHT stays at
+  // or below MAX_HEIGHT — a clamp that let a zero measurement (content not
+  // laid out yet, `main` not yet bound) through would break it.
   it("never answers with the caller's sentinel", () => {
     for (const measured of [0, 0.4, 1, 139.9]) {
       expect(nextPanelHeight(measured, 0)).toBe(MIN_HEIGHT);

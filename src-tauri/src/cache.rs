@@ -104,9 +104,17 @@ mod tests {
     /// whatever the wall clock says and however long the machine takes over
     /// the call, the reading taken inside `save_profile` lies between the one
     /// taken before it and the one taken after. That makes this both
-    /// unflakeable and tighter than the tolerance it replaces — it fails on a
-    /// timestamp that is stale by any amount at all, or on a `load_profile`
-    /// that returns a re-read clock instead of the stored value.
+    /// unflakeable and tighter than the tolerance it replaces: it fails on a
+    /// timestamp that is stale by any amount at all.
+    ///
+    /// The bracket alone does *not* catch a `load_profile` that reads the
+    /// clock instead of returning the stored field — such a value lands
+    /// inside `[before, after]` too. The second read below is what catches
+    /// that, and it is worth the two milliseconds: this is the only test
+    /// asserting that `load_profile`'s timestamp is the stored one, and
+    /// `poller.rs`'s startup read is its only production consumer, where a
+    /// re-read clock would report the cached profile as freshly fetched and
+    /// suppress the refetch forever.
     #[test]
     fn round_trips_a_profile_with_its_timestamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -125,6 +133,16 @@ mod tests {
             (before..=after).contains(&stored_at),
             "stored_at {stored_at} falls outside [{before}, {after}], so it is \
              not the reading save_profile took"
+        );
+
+        // Long enough that any clock this runs on can tell the two reads
+        // apart, short enough not to be felt.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (_, read_again) = load_profile(dir.path()).unwrap();
+        assert_eq!(
+            read_again, stored_at,
+            "two reads of the same file disagreed, so load_profile is \
+             reporting a clock rather than the stored timestamp"
         );
     }
 
@@ -149,6 +167,14 @@ mod tests {
     /// It fails on *any* added field, harmless ones included. That is the
     /// point: the question it forces is "does this belong on disk", and the
     /// cost of answering it is one line here.
+    ///
+    /// One hole, for whoever hits that compile error next: this watches the
+    /// *serialized* key set, so a field carrying `#[serde(skip)]`, or
+    /// `skip_serializing_if = "Option::is_none"` and left `None` in the
+    /// literal below, slips through here while `fetch_profile` populates it
+    /// in production. If you are filling in a new field to make this compile,
+    /// give it a value that would actually be written and check what happens
+    /// — the key set is a tripwire, not the whole guard.
     #[test]
     fn the_cached_profile_holds_only_the_two_fields_it_is_allowed_to() {
         let dir = tempfile::tempdir().unwrap();
