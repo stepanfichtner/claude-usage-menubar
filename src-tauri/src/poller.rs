@@ -636,7 +636,7 @@ mod tests {
         );
     }
 
-    /// These two constants are measured, not chosen, and the measurement is the
+    /// These constants are measured, not chosen, and the measurement is the
     /// only thing that justifies them: against the live endpoint, four requests
     /// inside ten seconds returned 429, three requests four seconds apart did
     /// not, and recovery from a 429 took 111 seconds.
