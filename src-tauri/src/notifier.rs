@@ -423,6 +423,111 @@ mod tests {
         );
     }
 
+    /// The tolerance comparison is a strict `<`, so a `resets_at` exactly
+    /// `SAME_WINDOW_TOLERANCE_SECS` from the anchor is a *different* window
+    /// and re-arms every threshold under the quota's current percentage.
+    ///
+    /// Both halves fail against opposite mutants. The 299s call fails if the
+    /// tolerance shrinks — jitter would start re-firing banners on every
+    /// poll, which is the bug the tolerance exists for. The 300s call fails
+    /// if the `<` becomes `<=`, or if the tolerance grows. The seconds are
+    /// written out rather than derived from `SAME_WINDOW_TOLERANCE_SECS` on
+    /// purpose: deriving them would make the test follow a changed constant
+    /// instead of pinning it, and the five minutes is itself a judgement
+    /// (the shortest real window is five hours, so a genuine reset can never
+    /// land this close to the previous one).
+    ///
+    /// Note that the anchor stays at `t0` for all three calls: `evaluate`
+    /// rewrites `window` only when `same_window` is false, so the 300s call
+    /// is compared against the window's first-seen value and not against the
+    /// 299s one.
+    #[test]
+    fn a_reset_time_exactly_the_tolerance_away_is_a_new_window() {
+        let mut notifier = Notifier::new();
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+        notifier.evaluate(&[quota(0.0, Some(t0))], &THRESHOLDS); // prime past the first-sight rule
+        assert_eq!(
+            notifier
+                .evaluate(&[quota(55.0, Some(t0))], &THRESHOLDS)
+                .len(),
+            1,
+            "the initial crossing must fire"
+        );
+
+        assert!(
+            notifier
+                .evaluate(
+                    &[quota(55.0, Some(t0 + chrono::Duration::seconds(299)))],
+                    &THRESHOLDS
+                )
+                .is_empty(),
+            "one second inside the tolerance is still the same window"
+        );
+
+        let fired = notifier.evaluate(
+            &[quota(55.0, Some(t0 + chrono::Duration::seconds(300)))],
+            &THRESHOLDS,
+        );
+        assert_eq!(
+            fired.len(),
+            1,
+            "exactly the tolerance away is a new window — a `<=` here would \
+             swallow it and stay silent"
+        );
+    }
+
+    /// The asymmetric arm of `same_window`. A `resets_at` that appears or
+    /// disappears is neither `(None, None)` nor `(Some, Some)`, so it falls
+    /// to the `_` arm, which answers `false` — a window change. That resets
+    /// `highest_fired` to 0, and the same poll then re-announces the highest
+    /// threshold the quota is already standing on: a banner the user has
+    /// already seen, for a window that never reset. It is the loudest
+    /// failure available in this module, which is why it is pinned.
+    ///
+    /// The shape is not hypothetical: `weekly_scoped` ships
+    /// `"resets_at": null` in the live payload today
+    /// (tests/fixtures/usage_full.json), so a quota that carries a timestamp
+    /// on one poll and null on the next is something this server can
+    /// produce, and a field that flaps fires on every other poll — the third
+    /// call below.
+    ///
+    /// This pins today's answer rather than endorsing it. The alternative —
+    /// reading a missing `resets_at` as "no news, same window" — is a real
+    /// option and a quieter one; its cost is that a quota whose reset time
+    /// goes missing could then never re-arm, which is exactly the behaviour
+    /// `a_quota_with_no_reset_time_does_not_re_arm` already pins for the
+    /// `(None, None)` case. Whichever way that is decided, this test is
+    /// where the decision is written down: it fails the moment the `_` arm
+    /// answers `true`.
+    #[test]
+    fn a_resets_at_that_appears_or_disappears_counts_as_a_new_window() {
+        let mut notifier = Notifier::new();
+        let window = reset_at(10);
+        notifier.evaluate(&[quota(0.0, window)], &THRESHOLDS); // prime past the first-sight rule
+
+        let fired = notifier.evaluate(&[quota(85.0, window)], &THRESHOLDS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].threshold, 80, "80 is announced once, normally");
+
+        // Same window, same 85% — but this poll carried no `resets_at`.
+        let refired = notifier.evaluate(&[quota(85.0, None)], &THRESHOLDS);
+        assert_eq!(
+            refired.len(),
+            1,
+            "a `resets_at` going missing is read as a new window, so the \
+             threshold re-arms and fires again"
+        );
+        assert_eq!(refired[0].threshold, 80, "the same banner, a second time");
+
+        // And back again: the timestamp returning is another window change.
+        assert_eq!(
+            notifier.evaluate(&[quota(85.0, window)], &THRESHOLDS).len(),
+            1,
+            "the return trip is a window change too, so a server that flaps \
+             this field fires on every other poll"
+        );
+    }
+
     #[test]
     fn a_quota_with_no_reset_time_does_not_re_arm() {
         let mut notifier = Notifier::new();
