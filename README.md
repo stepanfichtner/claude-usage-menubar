@@ -141,6 +141,12 @@ pnpm tauri dev     # run
 pnpm tauri build   # produce installers
 ```
 
+That last command finishes by signing the updater artifacts (see Releasing),
+which needs the release signing key. Without it the `.app` and the `.dmg` are
+still written, and the build then stops with `A public key has been found, but
+no private key` — pass `--no-sign` to skip that step on a local build. `pnpm
+run reinstall` already ignores it and installs the `.app` it finds.
+
 Ubuntu build dependencies:
 
 ```bash
@@ -195,6 +201,13 @@ publishes a draft GitHub release with `latest.json` for the in-app updater
 attached. The Ubuntu leg is disabled for 0.1.0 — see the Ubuntu section under
 Install — and returns to this workflow once someone has verified the Linux
 build on real hardware.
+
+`"createUpdaterArtifacts": true` in `src-tauri/tauri.conf.json` is what makes
+that last part work: it is the switch that tells `tauri build` to emit the
+`.app.tar.gz` and its `.sig` next to the `.dmg`. It defaults to `false`, and
+without it the build produces nothing for `latest.json` to point at, so
+**Check for Updates…** fails on every install no matter how correct the rest
+of the pipeline is. It is load-bearing, not noise.
 
 **If the macOS build job fails**, it is almost certainly the same `create-dmg`
 race described above ("If the DMG step fails"), now hitting the build job's

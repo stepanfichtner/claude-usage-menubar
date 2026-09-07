@@ -130,8 +130,20 @@ impl UpdateCheckStatus {
     // directly to prove a status change reaches `trailing_rows()` output
     // with no poll involved (R52) — production code only ever calls them
     // from `spawn_check` below.
-    pub(crate) fn set_checking(&self) {
-        *self.0.lock().unwrap() = CheckState::Checking;
+
+    /// Enters `Checking`, reporting whether it actually transitioned. `false`
+    /// means a check was already in flight and this caller must not start a
+    /// second one: two `download_and_install` calls would write the same
+    /// `/Applications` bundle concurrently and then restart the app twice.
+    /// The check-and-set happens under one lock, so two menu clicks racing on
+    /// two threads still yield exactly one `true`.
+    pub(crate) fn set_checking(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        if matches!(*state, CheckState::Checking) {
+            return false;
+        }
+        *state = CheckState::Checking;
+        true
     }
 
     pub(crate) fn set_done(&self, outcome: CheckOutcome) {
@@ -178,7 +190,13 @@ impl UpdateCheckStatus {
 /// sufficient on its own without also forcing the rebuild that reads it.
 pub fn spawn_check(app: AppHandle) {
     if let Some(status) = app.try_state::<std::sync::Arc<UpdateCheckStatus>>() {
-        status.set_checking();
+        // A check is already running: leave it alone. Returning before
+        // `refresh_menu` too, because the label already says "Checking for
+        // updates…" — rebuilding the menu again would only redraw the same
+        // text this click did not change.
+        if !status.set_checking() {
+            return;
+        }
     }
     crate::tray::refresh_menu(&app);
     tauri::async_runtime::spawn(async move {
@@ -389,6 +407,27 @@ mod tests {
     /// — seconds later — would silently wipe it. Reading the label twice in
     /// a row, simulating two such rebuilds while the outcome is still
     /// fresh, must return the same text both times.
+    /// Two clicks on `Check for Updates…` in quick succession used to give
+    /// two concurrent `download_and_install` calls writing the same
+    /// `/Applications` bundle, and then two `app.restart()`. `spawn_check`
+    /// needs an `AppHandle`, so the guard lives here in the state machine
+    /// where it can be tested: entering `Checking` twice must report one
+    /// transition, not two.
+    #[test]
+    fn a_second_check_while_one_is_in_flight_does_not_start_another() {
+        let status = UpdateCheckStatus::default();
+        assert!(status.set_checking(), "the first click must start a check");
+        assert!(
+            !status.set_checking(),
+            "a second click while a check is in flight must not start another"
+        );
+        status.set_done(CheckOutcome::UpToDate);
+        assert!(
+            status.set_checking(),
+            "once the check has finished, the next click starts a new one"
+        );
+    }
+
     #[test]
     fn a_done_outcome_survives_being_read_across_multiple_menu_rebuilds() {
         let status = UpdateCheckStatus::default();
