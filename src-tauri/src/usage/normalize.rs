@@ -109,6 +109,15 @@ mod tests {
         assert_eq!(quotas[2].id, "weekly:Fable");
         assert_eq!(quotas[2].label, "Fable this week");
         assert_eq!(quotas[2].resets_at, None);
+        // The one entry in this fixture that is genuinely at zero. Worth its
+        // own line because zero is the value a display-side floor would eat:
+        // `percent.max(1.0)`, added so a ring is always faintly visible,
+        // survives every other percentage asserted in this file (20, 2, 41.5,
+        // 12, 55, 95, 10) and is caught only here. It does not, on its own,
+        // prove the field was read rather than defaulted — `percent` carries
+        // `#[serde(default)]` and 0.0 is that default; the entries above,
+        // asserted at 20.0 and 2.0, are what pin the read.
+        assert_eq!(quotas[2].percent, 0.0);
     }
 
     #[test]
@@ -120,11 +129,77 @@ mod tests {
         assert!(!quotas[1].is_active);
     }
 
+    /// Replaces `codename_keys_are_ignored`, which asserted that no quota id
+    /// contained "nimbus" or "juniper". Nothing could have made that fail:
+    /// no struct in `usage::raw` carries `deny_unknown_fields`, so serde
+    /// drops unknown keys unconditionally and there was no branch to
+    /// regress — and `limits_array_wins_over_legacy_keys` already pins the
+    /// count at 3, which is what actually rules out a stray quota being
+    /// synthesised from a top-level key.
+    ///
+    /// The falsifiable property underneath it is the opposite one: unknown
+    /// keys must be *tolerated*. This endpoint is undocumented and its
+    /// response already carries keys this app does not model, at every level
+    /// (`nimbus_quill` and `member_dashboard_available` at the top,
+    /// `group` inside a limit, `surface` inside a scope, `id` inside a
+    /// model). `fetch_usage` maps any deserialization failure to
+    /// `ApiError::Parse`, so adding `deny_unknown_fields` — the ordinary
+    /// reflex when tightening a parser — would blank the menu bar the day
+    /// Anthropic adds a field. That is a plausible one-line change, and this
+    /// is the test that stops it: it fails on `deny_unknown_fields` anywhere
+    /// in `usage::raw`, with a message that says why the tolerance is there.
     #[test]
-    fn codename_keys_are_ignored() {
-        let quotas = normalize(&load("usage_full.json"));
-        assert!(!quotas.iter().any(|q| q.id.contains("nimbus")));
-        assert!(!quotas.iter().any(|q| q.id.contains("juniper")));
+    fn unknown_response_keys_are_tolerated_rather_than_rejected() {
+        let raw: crate::usage::raw::RawUsage = serde_json::from_str(
+            r#"{
+              "nimbus_quill": { "utilization": 0.0, "resets_at": null },
+              "juniper_tide": { "eligible": false },
+              "member_dashboard_available": false,
+              "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 7,
+                  "some_field_added_next_quarter": 1,
+                  "scope": { "surface": null,
+                             "model": { "id": "m", "display_name": "Fable" } } }
+              ]
+            }"#,
+        )
+        .expect(
+            "the usage endpoint is undocumented and adds keys; rejecting an \
+             unknown one turns every future field into ApiError::Parse",
+        );
+
+        let quotas = normalize(&raw);
+        assert_eq!(quotas.len(), 1, "only limits[] may become quotas");
+        assert_eq!(quotas[0].id, "weekly:Fable");
+    }
+
+    /// `from_limit` walks `scope -> model -> display_name` through three
+    /// `Option` layers and falls back to `"scoped"` when any of them is
+    /// absent. That it does not panic is obvious by inspection — `and_then`
+    /// short-circuits — but only while the chain stays a chain: an `unwrap`
+    /// or `expect` added to any link while chasing something else panics the
+    /// whole poll and takes every other quota down with it, since `normalize`
+    /// maps the list in one pass. This is the regression guard for that, and
+    /// the only coverage the `"scoped"` fallback label has at all.
+    ///
+    /// The three entries are the three distinct ways the name can go
+    /// missing: no scope object, a scope with no model, a model with no
+    /// display name. Their percentages differ so the assertions cannot be
+    /// satisfied by one entry rendered three times.
+    #[test]
+    fn a_scoped_weekly_with_no_model_name_falls_back_to_scoped() {
+        let quotas = normalize(&load("usage_scoped_without_model.json"));
+        assert_eq!(quotas.len(), 3);
+        for quota in &quotas {
+            assert_eq!(quota.id, "weekly:scoped");
+            assert_eq!(quota.label, "scoped this week");
+        }
+        let percents: Vec<f64> = quotas.iter().map(|q| q.percent).collect();
+        assert_eq!(
+            percents,
+            vec![10.0, 20.0, 30.0],
+            "three separate limits, mapped in order"
+        );
     }
 
     #[test]

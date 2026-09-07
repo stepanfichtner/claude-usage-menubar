@@ -1,0 +1,12 @@
+{
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 10, "severity": "normal",
+      "resets_at": null, "scope": null, "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 20, "severity": "normal",
+      "resets_at": null, "scope": { "model": null, "surface": null }, "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 30, "severity": "normal",
+      "resets_at": null,
+      "scope": { "model": { "id": null, "display_name": null }, "surface": null },
+      "is_active": false }
+  ]
+}
