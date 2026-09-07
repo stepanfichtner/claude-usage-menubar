@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -37,6 +38,17 @@ fn same_window(stored: Option<DateTime<Utc>>, incoming: Option<DateTime<Utc>>) -
 /// seen for it and is kept fixed for as long as `same_window` holds, since the
 /// server's value wobbles a little on every poll rather than staying fixed
 /// (spec §10.1).
+///
+/// Notifies on transitions this app has observed, not on state it inherited
+/// at startup (spec §10.2): the first `evaluate` call for a given quota id
+/// primes its thresholds already crossed as silently announced, rather than
+/// firing for them. This matters for two reasons — a fresh install should not
+/// carpet-bomb someone who was already at 85% with banners for 50 and 80, and
+/// on macOS a first-ever launch spends its opening seconds inside the OS's own
+/// notification-authorization window, where anything posted is delivered but
+/// never actually presented to the user, and silently lost until the window
+/// resets (hours to a week later). Priming means nothing is posted on that
+/// first poll at all, so there is nothing for the OS to lose.
 #[derive(Debug, Default)]
 pub struct Notifier {
     state: HashMap<String, Armed>,
@@ -50,29 +62,38 @@ impl Notifier {
     pub fn evaluate(&mut self, quotas: &[Quota], thresholds: &[u8]) -> Vec<Notification> {
         let mut fired = Vec::new();
         for quota in quotas {
-            let entry = self.state.entry(quota.id.clone()).or_insert(Armed {
-                highest_fired: 0,
-                window: quota.resets_at,
-            });
-
-            if !same_window(entry.window, quota.resets_at) {
-                entry.window = quota.resets_at;
-                entry.highest_fired = 0;
-            }
-
             let crossed = thresholds
                 .iter()
                 .copied()
                 .filter(|t| quota.percent >= f64::from(*t))
                 .max();
 
-            if let Some(highest) = crossed {
-                if highest > entry.highest_fired {
-                    entry.highest_fired = highest;
-                    fired.push(Notification {
-                        quota_label: quota.label.clone(),
-                        threshold: highest,
+            match self.state.entry(quota.id.clone()) {
+                Entry::Vacant(slot) => {
+                    // First sight of this quota id: record whatever was
+                    // already crossed as already-announced, but never fire —
+                    // that state was inherited, not observed.
+                    slot.insert(Armed {
+                        highest_fired: crossed.unwrap_or(0),
+                        window: quota.resets_at,
                     });
+                }
+                Entry::Occupied(mut slot) => {
+                    let entry = slot.get_mut();
+                    if !same_window(entry.window, quota.resets_at) {
+                        entry.window = quota.resets_at;
+                        entry.highest_fired = 0;
+                    }
+
+                    if let Some(highest) = crossed {
+                        if highest > entry.highest_fired {
+                            entry.highest_fired = highest;
+                            fired.push(Notification {
+                                quota_label: quota.label.clone(),
+                                threshold: highest,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -106,6 +127,7 @@ mod tests {
     #[test]
     fn fires_when_a_threshold_is_first_crossed() {
         let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(0.0, reset_at(10))], &THRESHOLDS); // prime past the first-sight rule
         let fired = notifier.evaluate(&[quota(55.0, reset_at(10))], &THRESHOLDS);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].threshold, 50);
@@ -117,6 +139,7 @@ mod tests {
     #[test]
     fn a_percentage_exactly_on_a_threshold_fires() {
         let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(0.0, reset_at(10))], &THRESHOLDS); // prime past the first-sight rule
         let fired = notifier.evaluate(&[quota(50.0, reset_at(10))], &THRESHOLDS);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].threshold, 50);
@@ -125,6 +148,7 @@ mod tests {
     #[test]
     fn stays_silent_below_every_threshold() {
         let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(0.0, reset_at(10))], &THRESHOLDS); // prime, so the checked call below is not itself the priming call
         assert!(notifier
             .evaluate(&[quota(12.0, reset_at(10))], &THRESHOLDS)
             .is_empty());
@@ -154,6 +178,7 @@ mod tests {
     #[test]
     fn jumping_past_several_thresholds_reports_only_the_highest() {
         let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(0.0, reset_at(10))], &THRESHOLDS); // prime past the first-sight rule
         let fired = notifier.evaluate(&[quota(95.0, reset_at(10))], &THRESHOLDS);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].threshold, 90);
@@ -184,6 +209,10 @@ mod tests {
     #[test]
     fn an_empty_threshold_list_disables_notifications() {
         let mut notifier = Notifier::new();
+        // Prime with the real thresholds first, so the checked call below is
+        // testing "an empty list disables notifications", not merely "the
+        // first sight of a quota is silent" for an unrelated reason.
+        notifier.evaluate(&[quota(0.0, reset_at(10))], &THRESHOLDS);
         assert!(notifier
             .evaluate(&[quota(99.0, reset_at(10))], &[])
             .is_empty());
@@ -195,8 +224,70 @@ mod tests {
         let mut weekly = quota(55.0, reset_at(10));
         weekly.id = "weekly_all".into();
         weekly.label = "Week · all models".into();
+
+        let mut weekly_priming = quota(0.0, reset_at(10));
+        weekly_priming.id = "weekly_all".into();
+        notifier.evaluate(&[quota(0.0, reset_at(10)), weekly_priming], &THRESHOLDS); // prime both quotas past the first-sight rule
+
         let fired = notifier.evaluate(&[quota(55.0, reset_at(10)), weekly], &THRESHOLDS);
         assert_eq!(fired.len(), 2);
+    }
+
+    /// A fresh start inherits whatever the user was already at. Firing for
+    /// thresholds crossed before the app existed is noise, and on a first-ever
+    /// launch it lands inside macOS's authorization window, where notifications
+    /// are delivered but never presented — silently lost until the window resets.
+    #[test]
+    fn the_first_evaluation_primes_without_firing() {
+        let mut notifier = Notifier::new();
+        assert!(
+            notifier
+                .evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS)
+                .is_empty(),
+            "the first sight of a quota must prime, not fire"
+        );
+    }
+
+    #[test]
+    fn priming_records_what_was_already_crossed() {
+        let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS);
+        // 80 was already crossed at priming, so re-seeing it is silent...
+        assert!(notifier
+            .evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS)
+            .is_empty());
+        // ...but crossing 90 afterwards is a transition this app observed.
+        let fired = notifier.evaluate(&[quota(92.0, reset_at(10))], &THRESHOLDS);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].threshold, 90);
+    }
+
+    #[test]
+    fn a_quota_first_seen_mid_run_also_primes() {
+        let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(55.0, reset_at(10))], &THRESHOLDS);
+        let mut weekly = quota(95.0, reset_at(10));
+        weekly.id = "weekly_all".into();
+        weekly.label = "Week · all models".into();
+        assert!(
+            notifier
+                .evaluate(&[quota(58.0, reset_at(10)), weekly], &THRESHOLDS)
+                .is_empty(),
+            "a newly appearing quota primes on its own first sight"
+        );
+    }
+
+    /// Priming must not swallow a genuine window reset later on.
+    #[test]
+    fn a_window_reset_after_priming_still_re_arms() {
+        let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(85.0, reset_at(10))], &THRESHOLDS);
+        notifier.evaluate(&[quota(5.0, reset_at(15))], &THRESHOLDS);
+        let fired = notifier.evaluate(&[quota(55.0, reset_at(15))], &THRESHOLDS);
+        assert_eq!(
+            fired[0].threshold, 50,
+            "a new window re-arms even after priming"
+        );
     }
 
     /// Guards the reason the anchor is kept fixed rather than refreshed to
@@ -220,6 +311,7 @@ mod tests {
     fn a_slow_drift_past_the_tolerance_is_eventually_caught() {
         let mut notifier = Notifier::new();
         let t0 = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap();
+        notifier.evaluate(&[quota(0.0, Some(t0))], &THRESHOLDS); // prime past the first-sight rule
 
         // Six polls, four minutes apart. Every consecutive pair is well
         // inside the 5-minute tolerance, but by the third poll the total
@@ -257,6 +349,8 @@ mod tests {
         let second = Utc.with_ymd_and_hms(2026, 9, 7, 16, 0, 0).unwrap()
             + chrono::Duration::milliseconds(376);
 
+        notifier.evaluate(&[quota(0.0, Some(first))], &THRESHOLDS); // prime past the first-sight rule
+
         assert_eq!(
             notifier
                 .evaluate(&[quota(55.0, Some(first))], &THRESHOLDS)
@@ -274,6 +368,7 @@ mod tests {
     #[test]
     fn a_quota_with_no_reset_time_does_not_re_arm() {
         let mut notifier = Notifier::new();
+        notifier.evaluate(&[quota(0.0, None)], &THRESHOLDS); // prime past the first-sight rule
         assert_eq!(
             notifier.evaluate(&[quota(55.0, None)], &THRESHOLDS).len(),
             1
@@ -315,6 +410,10 @@ mod tests {
         weekly.label = "Week · all models".into();
         let session = quota(55.0, reset_at(10));
 
+        let mut weekly_priming = quota(0.0, reset_at(10));
+        weekly_priming.id = "weekly_all".into();
+        notifier.evaluate(&[quota(0.0, reset_at(10)), weekly_priming], &THRESHOLDS); // prime both quotas past the first-sight rule
+
         assert_eq!(
             notifier
                 .evaluate(&[session.clone(), weekly.clone()], &THRESHOLDS)
@@ -343,7 +442,11 @@ mod tests {
         weekly.label = "Week · all models".into();
         let session = quota(55.0, reset_at(10));
 
-        // First call: session arms at 50, weekly arms at 90.
+        let mut weekly_priming = quota(0.0, reset_at(10));
+        weekly_priming.id = "weekly_all".into();
+        notifier.evaluate(&[quota(0.0, reset_at(10)), weekly_priming], &THRESHOLDS); // prime both quotas past the first-sight rule
+
+        // First real call: session arms at 50, weekly arms at 90.
         let fired = notifier.evaluate(&[session.clone(), weekly.clone()], &THRESHOLDS);
         assert_eq!(fired.len(), 2);
 
