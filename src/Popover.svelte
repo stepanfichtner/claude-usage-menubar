@@ -244,6 +244,16 @@
        2-column grid — past the panel's 320px. */
     min-width: 0;
   }
+  /* An odd number of rings used to leave the last card alone in the left
+     column with a card-sized hole beside it, which reads as a rendering
+     fault rather than a layout. Spanning it makes the odd case deliberate,
+     and echoes the full-width session meter directly below. `:last-child`
+     alone is not enough — it matches the second of two as well; pairing it
+     with `:nth-child(odd)` means "last, and at an odd position", which is
+     true exactly when the count is odd. Two rings is today's common case,
+     three becomes plausible as soon as another model gets its own weekly
+     window. */
+  .ring-card:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .ring-card.active { border-color: var(--fg-muted); }
   .ring-label {
     font-size: 12px;
