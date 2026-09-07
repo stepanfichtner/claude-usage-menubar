@@ -98,6 +98,14 @@ report back — it started, it read your credentials, the tray icon appeared,
 notifications fired — is what brings the `ubuntu-22.04` leg back to the
 release workflow.
 
+`bundle.targets` in `src-tauri/tauri.conf.json` lists only `dmg` and `app` to
+match that. The `bundle.linux.deb.depends` list next to it stays, though: those
+package names are researched knowledge that would be expensive to recover, and
+unlike `targets` they cause nothing to be built. They are waiting for the Linux
+leg, not left over from it. (The note lives here rather than beside them because
+Tauri parses `tauri.conf.json` as strict JSON with unknown keys rejected, so the
+file cannot hold a comment of its own.)
+
 ## Updating
 
 If you installed a release build, choose **Check for Updates…** from the tray
@@ -208,6 +216,12 @@ that last part work: it is the switch that tells `tauri build` to emit the
 without it the build produces nothing for `latest.json` to point at, so
 **Check for Updates…** fails on every install no matter how correct the rest
 of the pipeline is. It is load-bearing, not noise.
+
+**Then publish the draft — that is the step that arms the updater.** The
+endpoint the app polls is GitHub's `/releases/latest/download/latest.json`,
+and `latest` excludes drafts, so until someone opens the draft release and
+presses Publish, every installed copy's **Check for Updates…** gets a 404 and
+reports a failure. The release is not out until the draft is published.
 
 **If the macOS build job fails**, it is almost certainly the same `create-dmg`
 race described above ("If the DMG step fails"), now hitting the build job's
