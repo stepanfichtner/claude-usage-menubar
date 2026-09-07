@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod analytics;
 pub mod cache;
 pub mod credentials;
 pub mod error;
