@@ -58,12 +58,53 @@ impl CheckOutcome {
 pub fn spawn_check(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let outcome = run_check(&app).await;
-        let (title, body) = outcome.notification();
-        let _ = app.notification().builder().title(title).body(body).show();
+        report(&app, &outcome);
         if let CheckOutcome::Installing { .. } = outcome {
             app.restart();
         }
     });
+}
+
+/// Delivers an outcome to the user. The system notification is the primary
+/// channel, but showing it is itself fallible — notification permission
+/// revoked, no notification daemon on a minimal Linux desktop, any other
+/// OS-level refusal — and a `Check for Updates…` that produces nothing at
+/// all in that case is exactly the failure mode this module exists to rule
+/// out, for every outcome, `Failed` included.
+///
+/// On that failure this falls back to the tray icon's tooltip (persists
+/// until replaced, discoverable by hovering) and a stderr line. Neither is
+/// as good as the notification: the tooltip is a documented no-op on Linux
+/// in the `tray-icon` crate's GTK/AppIndicator backend (confirmed by
+/// reading `tray-icon-0.24.2/src/platform_impl/gtk/mod.rs`, whose
+/// `set_tooltip` always returns `Ok(())` without doing anything — so on
+/// Linux this call "succeeds" and nothing becomes visible), and stderr is
+/// only seen by someone who launched the app from a terminal rather than
+/// via autostart. On Linux specifically, if the notification daemon is the
+/// thing that failed, there is genuinely no channel left that is both
+/// reliable and visible without a dialog dependency this project has not
+/// taken on — that residual gap is real and is documented in the README
+/// rather than left to be discovered.
+fn report(app: &AppHandle, outcome: &CheckOutcome) {
+    let (title, body) = outcome.notification();
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title.clone())
+        .body(body.clone())
+        .show()
+    {
+        let line = fallback_text(&title, &body);
+        eprintln!("failed to show update-check notification ({line}): {e}");
+        if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+            let _ = tray.set_tooltip(Some(line));
+        }
+    }
+}
+
+/// The single line shared by the tray-tooltip and stderr fallbacks.
+fn fallback_text(title: &str, body: &str) -> String {
+    format!("{title}: {body}")
 }
 
 async fn run_check(app: &AppHandle) -> CheckOutcome {
@@ -131,23 +172,25 @@ mod tests {
         assert_eq!(body, "error sending request");
     }
 
-    /// This project has twice shipped a feature an ACL silently blocked
-    /// (the settings window's `invoke`, the popover's `setSize`). `updater()`
-    /// is a plain Rust method call — via `UpdaterExt`'s blanket impl for
-    /// `Manager<R>` — never routed through `invoke_handler`, so there is no
-    /// capability for it to be blocked by. That is not asserted by reading
-    /// the plugin's source: it is exercised here, against a real
-    /// (mocked-runtime) app with the plugin actually registered, and it
-    /// returns `Ok`, proving the plugin initialises and the call is
-    /// permitted rather than merely assumed to be.
+    /// What this actually proves: the plugin registers, and `app.updater()`
+    /// succeeds once the app's config carries a `plugins.updater` section
+    /// shaped like the real `tauri.conf.json` (a non-empty endpoint list —
+    /// the pubkey is never validated at this stage, only when a fetched
+    /// signature is actually verified, so any string does here).
+    ///
+    /// This does *not* by itself demonstrate ACL-freedom: `app.updater()`
+    /// was never routed through `invoke_handler` to begin with, so there
+    /// was no capability gate for this call to pass through in the first
+    /// place, mocked runtime or real one. The ACL argument is architectural
+    /// (see the module doc comment above) — `UpdaterExt` is a blanket impl
+    /// for `Manager<R>`, called directly from a menu event handler, never
+    /// through `invoke()` — not something this test exercises.
     #[test]
-    fn the_updater_plugin_initialises_and_the_call_is_not_acl_blocked() {
+    fn the_updater_plugin_registers_with_a_valid_config() {
         // `mock_context` leaves every plugin's config section absent, which
         // the updater plugin's mandatory (non-`Option`) `Config` cannot
         // deserialize from — so this fills in the one field that matters
-        // for building an `Updater` (a non-empty endpoint list). The pubkey
-        // is never validated at this stage, only when a fetched signature
-        // is actually verified, so any string does here.
+        // for building an `Updater` (a non-empty endpoint list).
         let mut context = tauri::test::mock_context(tauri::test::noop_assets());
         context.config_mut().plugins.0.insert(
             "updater".into(),
@@ -162,4 +205,25 @@ mod tests {
             .expect("failed to build mock app with the updater plugin registered");
         assert!(app.handle().updater().is_ok());
     }
+
+    #[test]
+    fn the_fallback_line_combines_title_and_body() {
+        assert_eq!(
+            fallback_text("Claude Usage update check failed", "boom"),
+            "Claude Usage update check failed: boom"
+        );
+    }
+
+    // `report`'s fallback path (the tray tooltip and the stderr line, taken
+    // when `.show()` itself fails) is not exercised by a test. Forcing that
+    // failure deterministically would require `tauri_plugin_notification`'s
+    // `.show()` to fail on command — but it calls straight into the real OS
+    // notification stack (`notify-rust` on desktop) regardless of
+    // `tauri::test::MockRuntime`, which stubs the windowing runtime, not the
+    // notification plugin's own OS calls. Making that failure injectable
+    // would mean adding fault-injection scaffolding to `report` for the
+    // sake of one fallback path, which is not warranted here. This is
+    // stated plainly rather than papered over with a test that stops at
+    // `notification()`'s string output, one layer above delivery, the way
+    // the three tests above do.
 }

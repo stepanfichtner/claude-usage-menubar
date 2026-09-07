@@ -100,7 +100,17 @@ Log out and back in if the icon does not appear.
 
 If you installed a release build, choose **Check for Updates…** from the tray
 menu. It downloads and installs any newer release and restarts the app; if the
-check fails or none is available, it says so rather than doing nothing.
+check fails or none is available, it says so via a system notification rather
+than doing nothing.
+
+That notification is itself not guaranteed to reach you — notification
+permission can be revoked, or a minimal Linux desktop may have no
+notification daemon running at all. If showing it fails, the app falls back
+to the tray icon's tooltip and a line on stderr. On Ubuntu specifically, the
+tooltip fallback is a documented no-op in the AppIndicator tray backend this
+app uses, so on Linux, if the notification itself cannot be shown, stderr —
+visible only if you launched the app from a terminal — is the only channel
+left. This gap is known and is not otherwise worked around.
 
 If you're running from a source checkout instead:
 
