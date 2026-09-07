@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  coveredRange,
   formatCost,
   formatTokens,
   modelLabel,
@@ -63,6 +64,59 @@ describe("formatCost", () => {
 
   it("treats zero unpriced tokens as nothing missing", () => {
     expect(formatCost(12.3456, 0)).toBe("$12.35");
+  });
+
+  // "$0.00" is the rendering reserved for a model that cost nothing, and a
+  // priced bucket that spent a third of a cent did not cost nothing. Rounding
+  // it down to "$0.00" makes real spend indistinguishable from free — the same
+  // mistake as pricing an unknown model at zero, one row further along.
+  it("does not round a real cost down to $0.00", () => {
+    expect(formatCost(0.004)).toBe("<$0.01");
+    expect(formatCost(0.0000001)).toBe("<$0.01");
+    expect(formatCost(0.004, 500)).toBe("<$0.01+");
+  });
+
+  it("still says $0.00 when the cost really is zero", () => {
+    expect(formatCost(0)).toBe("$0.00");
+  });
+
+  it("keeps rounding once a cost reaches a cent", () => {
+    expect(formatCost(0.005)).toBe("$0.01");
+    expect(formatCost(0.01)).toBe("$0.01");
+  });
+});
+
+describe("coveredRange", () => {
+  const day = (name: string): Bucket => ({
+    name,
+    tokens: 1,
+    cost: 0,
+    unpricedTokens: 0,
+  });
+
+  // The headline figure otherwise states no period at all, and its real window
+  // is however much transcript history happens to be on disk — Claude Code
+  // prunes old sessions, so it is neither "this month" nor a lifetime total.
+  // byDay is newest-first, so the span runs from the last element to the first.
+  it("spans the oldest and newest day with usage", () => {
+    const range = coveredRange([
+      day("2026-09-08"),
+      day("2026-09-07"),
+      day("2026-08-14"),
+    ]);
+    expect(range).toEqual({ first: "2026-08-14", last: "2026-09-08", days: 3 });
+  });
+
+  it("handles a single day without inverting it", () => {
+    expect(coveredRange([day("2026-09-08")])).toEqual({
+      first: "2026-09-08",
+      last: "2026-09-08",
+      days: 1,
+    });
+  });
+
+  it("is null when there is nothing to describe", () => {
+    expect(coveredRange([])).toBeNull();
   });
 });
 

@@ -60,12 +60,19 @@ export function formatTokens(tokens: number): string {
  * second is true is the precise failure this tab has to avoid.
  */
 export function formatCost(cost: number, unpricedTokens = 0): string {
+  const marker = unpricedTokens > 0 ? "+" : "";
+  // "$0.00" is reserved for a bucket that genuinely cost nothing, which is
+  // what a wholly unpriced model would otherwise be shown as. A priced bucket
+  // that spent a third of a cent did not cost nothing, and rounding it down
+  // makes real spend indistinguishable from free — the same error as pricing
+  // an unknown model at zero, one step further along.
+  if (cost > 0 && cost < 0.005) return `<$0.01${marker}`;
   // Grouped by hand rather than through `toLocaleString`, whose separator
   // follows the machine's locale — a figure this app formats itself reads the
   // same in a screenshot as it does in a test.
   const [whole, decimals] = cost.toFixed(2).split(".");
   const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `$${grouped}.${decimals}${unpricedTokens > 0 ? "+" : ""}`;
+  return `$${grouped}.${decimals}${marker}`;
 }
 
 /**
@@ -111,4 +118,31 @@ export function unpricedModels(byModel: Bucket[]): Bucket[] {
   return byModel
     .filter((bucket) => bucket.unpricedTokens > 0)
     .sort((a, b) => b.unpricedTokens - a.unpricedTokens);
+}
+
+/**
+ * The span the estimate actually covers, or `null` when there is nothing to
+ * describe.
+ *
+ * The headline figure otherwise states no period, and a total with no period
+ * invites being read as a lifetime one. Its real window is however much
+ * transcript history is on disk, which Claude Code prunes — so the honest
+ * thing is to name the first and last day the scan actually saw. `byDay`
+ * arrives newest-first, hence the ends being taken the way round they are.
+ *
+ * The days are local calendar days: `analytics::summarize` buckets by the
+ * user's timezone, not UTC, so this range means what it appears to mean.
+ *
+ * `days` counts days *with usage*, not the length of the span: idle days have
+ * no bucket, so the two differ and only the first claim is one this can make.
+ */
+export function coveredRange(
+  byDay: Bucket[],
+): { first: string; last: string; days: number } | null {
+  if (byDay.length === 0) return null;
+  return {
+    first: byDay[byDay.length - 1].name,
+    last: byDay[0].name,
+    days: byDay.length,
+  };
 }

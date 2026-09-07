@@ -20,6 +20,7 @@ pub mod scan;
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
 
 /// One row of a breakdown — a model, a project, or a day.
@@ -97,6 +98,18 @@ fn tokens_of(entry: &scan::Entry) -> u64 {
     entry.input + entry.output + entry.cache_write_5m + entry.cache_write_1h + entry.cache_read
 }
 
+/// Which calendar day an instant belongs to, in `zone`.
+///
+/// Timestamps are stored UTC, but "today" is a local idea, and bucketing by
+/// the UTC date puts an evening's work on tomorrow's row for everyone east of
+/// Greenwich — which is most of Europe for several hours of every day, and the
+/// user this ships to. `summarize` passes `Local`; the parameter exists so the
+/// behaviour can be pinned against fixed offsets in tests instead of against
+/// whatever zone the machine running them happens to be in.
+fn day_key<Tz: TimeZone>(timestamp: &DateTime<Utc>, zone: &Tz) -> String {
+    timestamp.with_timezone(zone).date_naive().to_string()
+}
+
 /// Cost-ranked, most expensive first.
 ///
 /// The final tie-break on name is not cosmetic: `groups` is a `HashMap`, so
@@ -158,14 +171,14 @@ pub fn summarize(entries: &[scan::Entry]) -> Summary {
             .or_default()
             .add(tokens, cost);
         by_day
-            .entry(entry.timestamp.format("%Y-%m-%d").to_string())
+            .entry(day_key(&entry.timestamp, &Local))
             .or_default()
             .add(tokens, cost);
     }
 
     // Days read as a timeline, so they sort by date rather than by cost. The
-    // key is `%Y-%m-%d`, which is fixed-width and zero-padded, so a reverse
-    // string sort is a reverse date sort.
+    // key is a `NaiveDate`'s ISO form — fixed-width and zero-padded — so a
+    // reverse string sort is a reverse date sort.
     let mut days: Vec<Bucket> = by_day
         .into_iter()
         .filter(spent_something)
@@ -247,16 +260,30 @@ mod tests {
         assert_eq!(summary.by_project[0].name, "alpha");
     }
 
+    /// Local noon on a given date, as the UTC instant an `Entry` carries.
+    ///
+    /// Built from local wall time rather than UTC because `summarize` buckets
+    /// by the local date: `Utc.with_ymd_and_hms(.., 23, 0, 0)` is already the
+    /// next day in central Europe, so a UTC-built fixture would make these
+    /// tests pass or fail according to the timezone of the machine running
+    /// them. Noon is the safe hour — DST transitions happen at night, so no
+    /// zone makes it ambiguous or non-existent.
+    fn local_noon(day: u32) -> chrono::DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(2026, 9, day, 12, 0, 0)
+            .single()
+            .expect("local noon is unambiguous in every timezone")
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn days_are_bucketed_newest_first() {
-        use chrono::TimeZone;
-        let day = |d: u32| chrono::Utc.with_ymd_and_hms(2026, 9, d, 12, 0, 0).unwrap();
         let mut older = entry("claude-opus-5", "alpha", 1_000_000, 0);
         older.request_id = "older".into();
-        older.timestamp = day(5);
+        older.timestamp = local_noon(5);
         let mut newer = entry("claude-opus-5", "alpha", 1_000_000, 0);
         newer.request_id = "newer".into();
-        newer.timestamp = day(7);
+        newer.timestamp = local_noon(7);
 
         let summary = summarize(&[older, newer]);
         assert_eq!(summary.by_day.len(), 2);
@@ -266,15 +293,40 @@ mod tests {
 
     #[test]
     fn entries_on_the_same_day_are_merged() {
-        use chrono::TimeZone;
+        // Noon and eleven hours later — the same local day everywhere, which a
+        // pair built from 01:00 and 23:00 UTC is not.
         let mut a = entry("claude-opus-5", "alpha", 1_000_000, 0);
-        a.timestamp = chrono::Utc.with_ymd_and_hms(2026, 9, 7, 1, 0, 0).unwrap();
+        a.timestamp = local_noon(7) - chrono::Duration::hours(6);
         let mut b = entry("claude-opus-5", "beta", 1_000_000, 0);
-        b.timestamp = chrono::Utc.with_ymd_and_hms(2026, 9, 7, 23, 0, 0).unwrap();
+        b.timestamp = local_noon(7) + chrono::Duration::hours(5);
 
         let summary = summarize(&[a, b]);
         assert_eq!(summary.by_day.len(), 1);
+        assert_eq!(summary.by_day[0].name, "2026-09-07");
         assert_eq!(summary.by_day[0].tokens, 2_000_000);
+    }
+
+    /// A day is the user's day, not UTC's.
+    ///
+    /// Driven against fixed offsets rather than `Local`, so it asserts the
+    /// same thing on a CI runner in UTC as on the machine this ships to. Both
+    /// cases are ones the old `%Y-%m-%d` on the UTC timestamp got wrong: at
+    /// +02:00, which is central Europe in September, an evening's work landed
+    /// on tomorrow's row for the last two hours of every day; at -05:00 the
+    /// small hours landed on yesterday's.
+    #[test]
+    fn a_day_is_the_local_calendar_day_not_the_utc_one() {
+        use chrono::FixedOffset;
+
+        let late_evening = Utc.with_ymd_and_hms(2026, 9, 7, 23, 0, 0).unwrap();
+        let central_europe = FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(day_key(&late_evening, &Utc), "2026-09-07");
+        assert_eq!(day_key(&late_evening, &central_europe), "2026-09-08");
+
+        let small_hours = Utc.with_ymd_and_hms(2026, 9, 7, 1, 0, 0).unwrap();
+        let new_york = FixedOffset::west_opt(5 * 3600).unwrap();
+        assert_eq!(day_key(&small_hours, &Utc), "2026-09-07");
+        assert_eq!(day_key(&small_hours, &new_york), "2026-09-06");
     }
 
     #[test]
@@ -354,9 +406,14 @@ mod tests {
     }
 
     /// Every model in the price table costs something, so a summary drawn only
-    /// from priced models must report nothing unpriced anywhere. This is the
-    /// negative half of the two tests above: without it they would still pass
-    /// if `unpriced_tokens` were simply set to `tokens` everywhere.
+    /// from priced models must report nothing unpriced anywhere.
+    ///
+    /// What this catches that the two tests above do not is the classification
+    /// going wrong in the safe-looking direction: a *priced* model treated as
+    /// unpriced. Those tests only ever look at buckets they expect to be
+    /// unpriced, so a `cost_of` that returned `None` too eagerly would leave
+    /// them green while quietly emptying the estimate and papering it over
+    /// with a warning.
     #[test]
     fn a_wholly_priced_summary_reports_nothing_unpriced() {
         let summary = summarize(&[

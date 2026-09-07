@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import Callout from "./Callout.svelte";
   import {
+    coveredRange,
     formatCost,
     formatTokens,
     modelLabel,
@@ -29,6 +30,10 @@
   // ran on a model this build has no price for. `formatCost` puts the "+" on
   // those figures and the callout below says why.
   const missing = $derived(summary ? unpricedModels(summary.byModel) : []);
+
+  // A total with no period stated invites being read as a lifetime one. What
+  // this actually covers is whatever transcript history is still on disk.
+  const covered = $derived(summary ? coveredRange(summary.byDay) : null);
 </script>
 
 {#if error}
@@ -43,8 +48,11 @@
     <span>{formatCost(summary.totalCost, summary.unpricedTokens)}</span>
   </div>
   <p class="caveat">
-    Estimate only — API list prices applied to subscription usage, from your
-    local transcripts. Not a bill.
+    {#if covered}
+      Covers {covered.first} to {covered.last} — every transcript still on disk;
+      Claude Code prunes older ones.
+    {/if}
+    Estimate from API list prices applied to subscription usage, not a bill.
   </p>
 
   {#if missing.length > 0}
@@ -86,7 +94,9 @@
     </div>
   {/each}
 
-  <h4>Last 14 days</h4>
+  <!-- Not "Last 14 days": these are the newest 14 days that *had* usage, and
+       any idle day between them means they span more than fourteen. -->
+  <h4>Recent days</h4>
   {#each summary.byDay.slice(0, 14) as bucket (bucket.name)}
     <div class="row">
       <span>{bucket.name}</span>
