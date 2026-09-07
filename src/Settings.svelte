@@ -1,12 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { snapshot } from "./lib/stores";
+  import { mergeTitleEntries, type TitleEntry } from "./lib/titleEntries";
 
-  interface TitleEntry {
-    quotaId: string;
-    showPercent: boolean;
-    showCountdown: boolean;
-  }
   interface Settings {
     pollIntervalSecs: number;
     titleEntries: TitleEntry[];
@@ -36,22 +32,19 @@
     }
   });
 
-  // One row per quota the app currently knows about, not just the ones
+  // One row per quota the app currently knows about, in addition to the ones
   // already in titleEntries — otherwise a quota that was never added to the
-  // menu bar before (or is new) can never be ticked on. Existing on/off
-  // state is preserved by quotaId; a quota seen for the first time starts
-  // unchecked.
+  // menu bar before (or is new) can never be ticked on. `mergeTitleEntries`
+  // is a union, never a replacement (R43): an empty or absent snapshot (no
+  // snapshot yet, signed out, a transient blip) leaves existing entries
+  // untouched rather than wiping them, and an entry whose quota is missing
+  // from this particular snapshot survives too.
   $effect(() => {
-    if (!settings || !$snapshot) return;
-    const known = new Map(settings.titleEntries.map((e) => [e.quotaId, e]));
-    const merged = $snapshot.snapshot.quotas.map(
-      (q) => known.get(q.id) ?? { quotaId: q.id, showPercent: false, showCountdown: false },
+    if (!settings) return;
+    settings.titleEntries = mergeTitleEntries(
+      settings.titleEntries,
+      $snapshot?.snapshot.quotas ?? [],
     );
-    const currentIds = settings.titleEntries.map((e) => e.quotaId).join(",");
-    const nextIds = merged.map((e) => e.quotaId).join(",");
-    if (currentIds !== nextIds) {
-      settings.titleEntries = merged;
-    }
   });
 
   function labelFor(quotaId: string): string {
