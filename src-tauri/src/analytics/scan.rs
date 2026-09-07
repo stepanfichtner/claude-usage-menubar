@@ -94,14 +94,27 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
     let message = raw.message?;
     let usage = message.usage?;
 
-    // The TTL split is newer than the aggregate field. When it is missing,
-    // attribute the whole cache write to the 5-minute rate, the cheaper of the
-    // two, so the estimate errs low rather than high.
+    // The TTL split is newer than the aggregate field, and can be missing or
+    // incomplete. Missing: attribute the whole cache write to the 5-minute
+    // rate. Incomplete — a TTL beyond the two named here, so the parts sum to
+    // less than the aggregate — attribute the remainder the same way.
+    //
+    // The 5-minute rate is the cheaper of the two, so either kind of gap errs
+    // low rather than high. What must not happen is the remainder being
+    // dropped: those tokens would leave both the cost and the token count on a
+    // model that *is* priced, so nothing downstream would mark the figure
+    // short.
     let (write_5m, write_1h) = match usage.cache_creation {
-        Some(split) => (
-            split.ephemeral_5m_input_tokens,
-            split.ephemeral_1h_input_tokens,
-        ),
+        Some(split) => {
+            let (known_5m, known_1h) = (
+                split.ephemeral_5m_input_tokens,
+                split.ephemeral_1h_input_tokens,
+            );
+            let unattributed = usage
+                .cache_creation_input_tokens
+                .saturating_sub(known_5m.saturating_add(known_1h));
+            (known_5m.saturating_add(unattributed), known_1h)
+        }
         None => (usage.cache_creation_input_tokens, 0),
     };
 
@@ -125,8 +138,12 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
 /// cannot be reasoned about.
 ///
 /// Iterative rather than recursive, and `DirEntry::file_type` does not follow
-/// symlinks — a symlink pointing at an ancestor is a plain file here, not a
-/// directory to descend into, so no arrangement of links can loop this.
+/// symlinks: it reports a symlink as a symlink, which is neither `is_dir` nor
+/// `is_file`, so the match below skips it entirely. No arrangement of links
+/// can loop this walk, and the cost — a transcript reachable only through a
+/// symlink is not read — is accepted rather than overlooked. Claude Code
+/// writes real files; following links would mean resolving them and tracking
+/// visited inodes to stay safe, for a case that does not arise.
 fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -159,11 +176,12 @@ fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
 /// The walk goes all the way down, not one level. Claude Code keeps a
 /// session's subagent transcripts at
 /// `<project>/<session-uuid>/subagents/*.jsonl`, which on this machine is 164
-/// of 214 files; stopping at the project directory's immediate children found
-/// 8,782 of 15,215 requests and produced an estimate low by roughly two
-/// thirds, with nothing on screen to suggest it. The project name is still
-/// the top-level directory's, however deep the file sits — a subagent's spend
-/// belongs to the project whose session ran it.
+/// of 214 files. Stopping at the project directory's immediate children found
+/// 8,782 of 15,308 requests — 2.73B tokens against 3.56B, and $1,939 against
+/// $2,360, so 18% low in money and 23% in tokens — with nothing on screen to
+/// suggest it. The project name is still the top-level directory's, however
+/// deep the file sits: a subagent's spend belongs to the project whose session
+/// ran it.
 ///
 /// Every failure is a skip, never an error: an unreadable root, an unreadable
 /// project directory, a file that vanished between listing and opening, a
@@ -198,10 +216,37 @@ pub fn scan_dir(root: &Path, offsets: &mut HashMap<PathBuf, u64>) -> Vec<Entry> 
                 continue;
             }
 
+            // Read with `read_line`, which keeps the terminator, rather than
+            // `lines()`, which discards it. The cursor may only advance past
+            // bytes that are certainly there: `line.len() + 1` assumes every
+            // line ended in a newline, and a transcript caught mid-write — the
+            // last line present, its newline not yet flushed — then leaves the
+            // cursor one byte past the end of the file. That costs a full
+            // re-read of the whole transcript on every later scan, and if the
+            // file grows without supplying the missing newline it starts the
+            // next read one byte late and loses the request that follows.
+            let mut reader = BufReader::new(&mut handle);
             let mut consumed = start;
-            for line in BufReader::new(&mut handle).lines().map_while(Result::ok) {
-                consumed += line.len() as u64 + 1;
-                if let Some(entry) = parse_line(&line, &project) {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(bytes) = reader.read_line(&mut line) else {
+                    break;
+                };
+                if bytes == 0 {
+                    break;
+                }
+                // The unterminated tail is still parsed. A line that parses is
+                // a complete JSON object with only its terminator missing; a
+                // genuinely half-written one is invalid JSON and is discarded
+                // like any other. It is simply not counted as consumed, so the
+                // next scan reads it again — and the dedup below, plus the
+                // caller's own across-call guard, keep that from double
+                // counting it.
+                if line.ends_with('\n') {
+                    consumed += bytes as u64;
+                }
+                if let Some(entry) = parse_line(line.trim_end(), &project) {
                     // One request can span several lines; count it once. An
                     // empty id is not an identity, so it can never merge two
                     // genuinely different requests into one.
@@ -246,8 +291,21 @@ mod tests {
         assert_eq!(entry.cache_write_1h, 0);
     }
 
+    /// The first line is the one that makes the `type` guard load-bearing: it
+    /// is a user turn that nonetheless carries a full `usage` block, so
+    /// `message.usage?` would happily accept it and count those tokens a
+    /// second time, on top of the assistant turn that really reports them.
+    /// Without it the guard could be deleted and nothing would fail.
     #[test]
     fn ignores_non_assistant_and_malformed_lines() {
+        assert!(
+            parse_line(
+                r#"{"type":"user","requestId":"r1","timestamp":"2026-09-07T08:00:00.000Z","message":{"role":"user","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20}}}"#,
+                "alpha"
+            )
+            .is_none(),
+            "only assistant turns report what a request cost"
+        );
         assert!(parse_line(r#"{"type":"user","message":{"role":"user"}}"#, "alpha").is_none());
         assert!(parse_line("not json", "alpha").is_none());
         assert!(parse_line("", "alpha").is_none());
@@ -269,6 +327,9 @@ mod tests {
     fn the_project_name_comes_from_the_directory() {
         let mut offsets = HashMap::new();
         let entries = scan_dir(&fixture_root(), &mut offsets);
+        // `all` is vacuously true on an empty vec, so a scan that found
+        // nothing at all would otherwise satisfy this.
+        assert!(!entries.is_empty(), "the fixture must have been read");
         assert!(entries
             .iter()
             .all(|e| e.project == "-Users-me-Projects-alpha"));
@@ -435,6 +496,95 @@ mod tests {
                 .iter()
                 .all(|e| e.project == "-Users-me-Projects-alpha"),
             "a subagent's spend belongs to the project its session ran in"
+        );
+    }
+
+    /// The split being *incomplete* is a different failure from it being
+    /// absent, and a worse one. If `cache_creation` ever carries a TTL this
+    /// build does not know about, the two fields it does read sum to less than
+    /// `cache_creation_input_tokens`, and the remainder would vanish from the
+    /// cost *and* from the token count — on a priced model, so no "+" marker
+    /// would appear anywhere to say the figure was short.
+    ///
+    /// The remainder goes to the 5-minute rate, the cheaper of the two, so an
+    /// unknown TTL errs low rather than high — the same choice made when the
+    /// split is missing altogether.
+    #[test]
+    fn a_cache_split_that_does_not_add_up_keeps_the_remainder() {
+        let line = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T08:00:05.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":20}}}}"#;
+        let entry = parse_line(line, "alpha").unwrap();
+
+        assert_eq!(
+            entry.cache_write_1h, 20,
+            "the known 1-hour tokens are untouched"
+        );
+        assert_eq!(
+            entry.cache_write_5m, 80,
+            "the 50 tokens on an unrecognised TTL must not evaporate"
+        );
+        assert_eq!(
+            entry.cache_write_5m + entry.cache_write_1h,
+            100,
+            "every cache-creation token the line reports is accounted for"
+        );
+    }
+
+    /// The ordinary case must not gain phantom tokens from the same rule: when
+    /// the split already adds up, there is no remainder to attribute.
+    #[test]
+    fn a_cache_split_that_adds_up_is_left_alone() {
+        let line = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T08:00:05.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":15,"ephemeral_1h_input_tokens":25}}}}"#;
+        let entry = parse_line(line, "alpha").unwrap();
+        assert_eq!(entry.cache_write_5m, 15);
+        assert_eq!(entry.cache_write_1h, 25);
+    }
+
+    /// A transcript caught mid-write: the last line is there but its newline
+    /// has not been flushed yet. The cursor must not be left past the end of
+    /// the file — with `line.len() + 1` it was, which both forced a full
+    /// re-read of that whole transcript on every later scan and, if the file
+    /// grew without supplying the missing newline, started the next read one
+    /// byte late and lost the request that followed.
+    ///
+    /// The unterminated line is still parsed. If it parses at all it is a
+    /// complete JSON object with only its terminator missing; a genuinely
+    /// half-written line is invalid JSON and is discarded like any other.
+    #[test]
+    fn an_unterminated_final_line_leaves_the_cursor_inside_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-Users-me-Projects-alpha");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","timestamp":"2026-09-07T08:00:00.000Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":1,"output_tokens":0}}}}}}"#
+            )
+        };
+        std::fs::write(&path, format!("{}\n{}", line("a"), line("b"))).unwrap();
+
+        let mut offsets = HashMap::new();
+        let entries = scan_dir(dir.path(), &mut offsets);
+        assert_eq!(entries.len(), 2, "the unterminated line is still counted");
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        let cursor = offsets[&path];
+        assert!(
+            cursor <= size,
+            "cursor {cursor} is past the end of a {size}-byte file"
+        );
+
+        // The writer finishes the line and adds another.
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{}\n", line("a"), line("b"), line("c")),
+        )
+        .unwrap();
+
+        let appended = scan_dir(dir.path(), &mut offsets);
+        assert!(
+            appended.iter().any(|e| e.request_id == "c"),
+            "the line after the unterminated one must not be skipped"
         );
     }
 }
