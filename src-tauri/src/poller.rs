@@ -113,9 +113,11 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Notify;
 
 use crate::model::{Profile, UsageSnapshot};
+use crate::notifier::Notifier;
 use crate::{cache, credentials, profile as profile_api, usage};
 
 pub const PROFILE_MAX_AGE_HOURS: i64 = 24;
@@ -175,6 +177,7 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         let client = reqwest::Client::new();
         let mut backoff = Backoff::new();
         let mut auth = AuthState::Ok;
+        let mut notifier = Notifier::new();
         let cache_dir = app
             .path()
             .app_cache_dir()
@@ -226,6 +229,20 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                     }
 
                     crate::tray::apply(&app, &snapshot);
+
+                    let settings = crate::settings::load(&app);
+                    for notification in notifier.evaluate(&snapshot.quotas, &settings.thresholds) {
+                        let _ = app
+                            .notification()
+                            .builder()
+                            .title(format!(
+                                "{} at {}%",
+                                notification.quota_label, notification.threshold
+                            ))
+                            .body("Claude usage limit approaching")
+                            .show();
+                    }
+
                     emit(&app, &snapshot, &profile, false);
                     last_snapshot = Some(snapshot);
                 }

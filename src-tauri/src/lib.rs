@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod model;
+pub mod notifier;
 pub mod poller;
 pub mod profile;
 pub mod settings;
@@ -61,6 +62,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(poller::RefreshSignal::default()))
         .setup(|app| {
             #[cfg(target_os = "macos")]
