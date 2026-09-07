@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod model;
+pub mod usage;
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|_app| {
