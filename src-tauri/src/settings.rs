@@ -5,7 +5,12 @@ use tauri_plugin_store::StoreExt;
 use crate::tray::TitleEntry;
 
 pub const STORE_FILE: &str = "settings.json";
-pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
+
+/// Raised from 30 to 60 (see `the_poll_interval_floor_is_inclusive` below for
+/// why): the limit is burst-sensitive rather than rate-sensitive, recovery
+/// from a 429 takes about two minutes, and the windows being tracked are
+/// measured in hours and days, so a sub-minute poll buys nothing.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -95,13 +100,21 @@ mod tests {
             ..Settings::default()
         }
         .sanitized();
-        assert_eq!(settings.poll_interval_secs, 30);
+        assert_eq!(settings.poll_interval_secs, 60);
     }
 
-    /// The floor itself: 30 must survive untouched, 29 must be lifted.
+    /// The floor itself: 60 must survive untouched, 59 must be lifted. Written
+    /// as literals rather than `MIN_POLL_INTERVAL_SECS - 1` / `+ 1` on
+    /// purpose — a symbolic-only version of this table would still pass after
+    /// someone quietly changed the constant, since both sides would move
+    /// together. 60 is not an arbitrary round number either: it is a
+    /// measured floor (see the rate-limit provenance note on
+    /// `poller::MIN_MANUAL_REFRESH_SECS`'s canary test), so moving it should
+    /// mean re-justifying it against the endpoint's behavior, not editing
+    /// this assertion.
     #[test]
     fn the_poll_interval_floor_is_inclusive() {
-        for (given, expected) in [(29u64, 30u64), (30, 30), (31, 31)] {
+        for (given, expected) in [(59u64, 60u64), (60, 60), (61, 61)] {
             let settings = Settings {
                 poll_interval_secs: given,
                 ..Settings::default()

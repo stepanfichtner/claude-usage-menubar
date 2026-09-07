@@ -30,8 +30,8 @@
         "label": "settings",
         "url": "settings.html",
         "title": "Claude Usage — Settings",
-        "width": 420,
-        "height": 365,
+        "width": 660,
+        "height": 520,
         "resizable": false,
         "visible": false
       }

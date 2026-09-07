@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { snapshot } from "./lib/stores";
+  import { now, snapshot } from "./lib/stores";
+  import { formatCompact } from "./lib/countdown";
   import { mergeTitleEntries, type TitleEntry } from "./lib/titleEntries";
 
   interface Settings {
@@ -9,6 +10,21 @@
     thresholds: number[];
     notificationsEnabled: boolean;
     launchAtLogin: boolean;
+  }
+
+  // The only values worth offering: see `MIN_POLL_INTERVAL_SECS`'s doc
+  // comment in src-tauri/src/settings.rs for why 60s is the floor, and why
+  // there is no preset below it.
+  const POLL_INTERVAL_PRESETS = [
+    { value: 60, label: "Every minute" },
+    { value: 120, label: "Every 2 minutes" },
+    { value: 180, label: "Every 3 minutes" },
+    { value: 300, label: "Every 5 minutes" },
+    { value: 600, label: "Every 10 minutes" },
+  ];
+
+  function isKnownPollInterval(value: number): boolean {
+    return POLL_INTERVAL_PRESETS.some((preset) => preset.value === value);
   }
 
   let settings = $state<Settings | null>(null);
@@ -50,6 +66,30 @@
     return $snapshot?.snapshot.quotas.find((q) => q.id === quotaId)?.label ?? quotaId;
   }
 
+  // Mirrors `tray::render_title` on the Rust side exactly: same quotas, same
+  // filter (an entry with nothing to show, or whose quota isn't in this
+  // snapshot, drops out entirely rather than leaving a blank segment), same
+  // "percent · countdown" and two-space join. Built entirely from data this
+  // window already holds for `labelFor` above plus the checkboxes below, so
+  // it costs no extra command or round trip.
+  let previewTitle = $derived.by(() => {
+    if (!settings) return "";
+    const quotas = $snapshot?.snapshot.quotas ?? [];
+    return settings.titleEntries
+      .map((entry) => {
+        const quota = quotas.find((q) => q.id === entry.quotaId);
+        if (!quota) return null;
+        const parts: string[] = [];
+        if (entry.showPercent) parts.push(`${Math.round(quota.percent)}%`);
+        if (entry.showCountdown && quota.resetsAt) {
+          parts.push(formatCompact(quota.resetsAt, $now));
+        }
+        return parts.length > 0 ? parts.join(" · ") : null;
+      })
+      .filter((segment): segment is string => segment !== null)
+      .join("  ");
+  });
+
   async function persist() {
     if (!settings) return;
     saveError = null;
@@ -87,69 +127,107 @@
   </main>
 {:else if settings}
   <main>
-    <label>
-      Refresh every
-      <input type="number" min="30" step="10" bind:value={settings.pollIntervalSecs} />
-      seconds
-    </label>
+    <div class="columns">
+      <section class="panel">
+        <h2>General</h2>
 
-    <label class="check">
-      <input type="checkbox" bind:checked={settings.notificationsEnabled} />
-      Notify me at these usage levels
-    </label>
+        <div class="group">
+          <label>
+            Refresh every
+            <select bind:value={settings.pollIntervalSecs}>
+              {#each POLL_INTERVAL_PRESETS as preset (preset.value)}
+                <option value={preset.value}>{preset.label}</option>
+              {/each}
+              {#if !isKnownPollInterval(settings.pollIntervalSecs)}
+                <option value={settings.pollIntervalSecs}>
+                  {settings.pollIntervalSecs} seconds (current)
+                </option>
+              {/if}
+            </select>
+          </label>
+        </div>
 
-    <div class="thresholds" class:disabled={!settings.notificationsEnabled}>
-      {#each settings.thresholds as _, i}
-        <span class="threshold">
-          <input
-            type="number"
-            min="1"
-            max="100"
-            disabled={!settings.notificationsEnabled}
-            bind:value={settings.thresholds[i]}
-          />
-          <span class="pct">%</span>
-          <button
-            type="button"
-            class="remove"
-            disabled={!settings.notificationsEnabled}
-            onclick={() => removeThreshold(i)}
-            aria-label="Remove threshold"
-          >&times;</button>
-        </span>
-      {/each}
-      {#if settings.thresholds.length === 0}
-        <span class="waiting">No thresholds set</span>
-      {/if}
-      <button
-        type="button"
-        class="add"
-        disabled={!settings.notificationsEnabled}
-        onclick={addThreshold}
-      >+ Add</button>
+        <div class="group">
+          <label class="check">
+            <input type="checkbox" bind:checked={settings.notificationsEnabled} />
+            Notify me at these usage levels
+          </label>
+
+          <div class="thresholds" class:disabled={!settings.notificationsEnabled}>
+            {#each settings.thresholds as _, i}
+              <span class="threshold">
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  disabled={!settings.notificationsEnabled}
+                  bind:value={settings.thresholds[i]}
+                />
+                <span class="pct">%</span>
+                <button
+                  type="button"
+                  class="remove"
+                  disabled={!settings.notificationsEnabled}
+                  onclick={() => removeThreshold(i)}
+                  aria-label="Remove threshold"
+                >&times;</button>
+              </span>
+            {/each}
+            {#if settings.thresholds.length === 0}
+              <span class="waiting">No thresholds set</span>
+            {/if}
+            <button
+              type="button"
+              class="add"
+              disabled={!settings.notificationsEnabled}
+              onclick={addThreshold}
+            >+ Add</button>
+          </div>
+        </div>
+
+        <div class="group">
+          <label class="check">
+            <input type="checkbox" bind:checked={settings.launchAtLogin} />
+            Launch at login
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Menu bar</h2>
+        <p class="hint">
+          Choose what each usage limit shows next to the icon in your menu bar.
+        </p>
+
+        {#if settings.titleEntries.length === 0}
+          <p class="waiting">Waiting for usage data…</p>
+        {:else}
+          <div class="quota-list">
+            {#each settings.titleEntries as entry (entry.quotaId)}
+              <div class="quota-group">
+                <p class="quota-name">{labelFor(entry.quotaId)}</p>
+                <label class="check">
+                  <input type="checkbox" bind:checked={entry.showPercent} />
+                  Percentage remaining
+                </label>
+                <label class="check">
+                  <input type="checkbox" bind:checked={entry.showCountdown} />
+                  Time until reset
+                </label>
+              </div>
+            {/each}
+          </div>
+
+          <div class="preview">
+            <span class="preview-label">Menu bar preview</span>
+            <span class="preview-value">{previewTitle || "(nothing shown)"}</span>
+          </div>
+        {/if}
+      </section>
     </div>
 
-    <label class="check">
-      <input type="checkbox" bind:checked={settings.launchAtLogin} />
-      Launch at login
-    </label>
-
-    <fieldset>
-      <legend>Menu bar</legend>
-      {#if settings.titleEntries.length === 0}
-        <p class="waiting">Waiting for usage data…</p>
-      {/if}
-      {#each settings.titleEntries as entry (entry.quotaId)}
-        <div class="entry">
-          <span>{labelFor(entry.quotaId)}</span>
-          <label><input type="checkbox" bind:checked={entry.showPercent} /> %</label>
-          <label><input type="checkbox" bind:checked={entry.showCountdown} /> countdown</label>
-        </div>
-      {/each}
-    </fieldset>
-
     <footer>
-      <button onclick={persist}>Save</button>
+      <button class="primary" onclick={persist}>Save</button>
       {#if saved}<span class="ok">Saved</span>{/if}
       {#if saveError}<span class="error">Could not save: {saveError}</span>{/if}
     </footer>
@@ -157,32 +235,63 @@
 {/if}
 
 <style>
-  main { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-  label { display: flex; align-items: center; gap: 8px; }
-  label.check { gap: 8px; }
-  input[type="number"] { width: 72px; }
-  fieldset {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 12px;
-    max-height: 150px;
+  main {
+    box-sizing: border-box;
+    height: 100vh;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
     overflow-y: auto;
   }
-  .entry { display: flex; gap: 12px; align-items: center; padding: 4px 0; }
-  .entry span {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
   }
-  .waiting { color: var(--fg-muted); font-size: 12px; margin: 4px 0; }
+  .panel {
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .panel h2 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .hint {
+    margin: -8px 0 0;
+    color: var(--fg-muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .group + .group {
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
+  }
+  label { display: flex; align-items: center; gap: 8px; }
+  label.check { gap: 8px; }
+  select {
+    font: inherit;
+    color: inherit;
+    background: var(--track);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 6px;
+  }
+  input[type="number"] { width: 60px; }
+
   .thresholds {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 6px;
-    margin: -2px 0 2px 24px;
+    margin: 8px 0 0 24px;
   }
   .thresholds.disabled { opacity: 0.5; }
   .threshold {
@@ -210,7 +319,73 @@
   .add { border: 1px dashed var(--border); }
   .threshold .remove:disabled,
   .add:disabled { cursor: default; }
-  footer { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .ok { color: var(--normal); font-size: 12px; }
+
+  .quota-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    /* Fits the two default quotas fully; a third or fourth (the API can
+       return up to four: session plus three weekly variants) scrolls within
+       this list rather than resizing the window around an uncommon case.
+       The fade starts right at that two-item boundary, so a partially
+       clipped third group fades to nothing instead of showing a header with
+       no checkboxes under it. */
+    max-height: 200px;
+    overflow-y: auto;
+    padding-right: 2px;
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  }
+  .quota-group {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .quota-name {
+    margin: 0 0 6px;
+    font-weight: 600;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .quota-group .check { padding: 2px 0; font-size: 12px; }
+
+  .preview {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+  .preview-label { color: var(--fg-muted); font-size: 12px; }
+  .preview-value {
+    font-variant-numeric: tabular-nums;
+    background: var(--track);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    overflow-wrap: break-word;
+  }
+
+  .waiting { color: var(--fg-muted); font-size: 12px; margin: 4px 0; }
+
+  footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  button.primary {
+    background: var(--fg);
+    color: var(--bg);
+    border: none;
+    border-radius: 8px;
+    padding: 12px 28px;
+    font: inherit;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button.primary:hover { opacity: 0.88; }
+  button.primary:active { opacity: 0.76; }
+  .ok { color: var(--normal); font-size: 12px; font-weight: 600; }
   .error { color: var(--critical); font-size: 12px; }
 </style>
