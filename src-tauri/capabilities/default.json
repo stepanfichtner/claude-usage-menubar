@@ -6,8 +6,10 @@
     "popover",
     "settings"
   ],
+  "comment": "Deliberately not `core:default`, which would also grant core:menu, core:tray (set_icon/set_menu/set_title/remove_by_id), core:path (resolve_directory hands the webview real home paths), core:webview, core:image and core:event:emit/emit_to. None of that is reachable from this frontend: the tray and the menu are built and mutated in Rust only. What the webview does call is `listen` (src/lib/stores.ts, for usage://snapshot) and `setSize` (src/Popover.svelte, to fit the panel to its content); `invoke` of this app's own #[tauri::command]s needs no permission. Tauri's ACL denies silently, so if you add a `@tauri-apps/api` call and it does nothing at runtime, this list is the first place to look.",
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-set-size"
   ]
 }
