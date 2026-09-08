@@ -104,14 +104,13 @@ describe("coveredRange", () => {
       day("2026-09-07"),
       day("2026-08-14"),
     ]);
-    expect(range).toEqual({ first: "2026-08-14", last: "2026-09-08", days: 3 });
+    expect(range).toEqual({ first: "2026-08-14", last: "2026-09-08" });
   });
 
   it("handles a single day without inverting it", () => {
     expect(coveredRange([day("2026-09-08")])).toEqual({
       first: "2026-09-08",
       last: "2026-09-08",
-      days: 1,
     });
   });
 

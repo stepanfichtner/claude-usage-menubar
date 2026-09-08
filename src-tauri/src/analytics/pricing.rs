@@ -289,13 +289,25 @@ mod tests {
                 "{model}"
             );
         }
-        // The loop above catches a row in `TABLE` that nothing pins; this
-        // catches the reverse, a row pinned here after it was dropped from
-        // `TABLE`. Together they make the two lists the same set of models.
+        // The loop above proves every `TABLE` row is pinned. Equal lengths do
+        // not prove the reverse: `TABLE` holding one model twice while
+        // `PUBLISHED` gains a different one keeps both lengths at 13, lets
+        // every `TABLE` row find a match, and ships the new model unpriced.
+        // Comparing the ids as sets is what actually rules that out, and the
+        // duplicate check is what makes the set comparison mean what it looks
+        // like it means — without it, `TABLE` could name twelve models in
+        // thirteen rows and still match.
+        let table_ids: std::collections::HashSet<&str> = TABLE.iter().map(|(id, _)| *id).collect();
+        let published_ids: std::collections::HashSet<&str> =
+            PUBLISHED.iter().map(|(id, ..)| *id).collect();
         assert_eq!(
+            table_ids.len(),
             TABLE.len(),
-            PUBLISHED.len(),
-            "PUBLISHED pins a model that TABLE no longer prices"
+            "TABLE names the same model twice"
+        );
+        assert_eq!(
+            table_ids, published_ids,
+            "TABLE and PUBLISHED do not name the same models"
         );
     }
 

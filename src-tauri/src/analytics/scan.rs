@@ -459,9 +459,8 @@ mod tests {
     /// directory: a session's subagent transcripts live at
     /// `<project>/<session-uuid>/subagents/*.jsonl`. On this machine that is
     /// 164 of 214 files — reading only the project directory's immediate
-    /// children found 8,782 requests where the tree holds 15,215, and the
-    /// estimate would have been low by roughly two thirds with nothing on
-    /// screen to suggest it.
+    /// children found 8,782 of 15,308 requests, leaving the estimate 18% low
+    /// in money and 23% in tokens, with nothing on screen to suggest it.
     ///
     /// The spend still belongs to the project the session ran in, so the
     /// project name stays the top-level directory's however deep the file is.
@@ -581,10 +580,22 @@ mod tests {
         )
         .unwrap();
 
+        // Of these two, `b` is the one that does the work. The old cursor sat
+        // one byte past the old end of file, which is exactly where `c` begins
+        // once the newline arrives — so the buggy code reads `c` fine and
+        // drops `b`, having counted it consumed before it was ever read.
+        // Asserting only `c` would pass either way. (The cursor assertion
+        // above catches the same bug and fires first; these two say what it
+        // costs.)
         let appended = scan_dir(dir.path(), &mut offsets);
+        let ids: Vec<&str> = appended.iter().map(|e| e.request_id.as_str()).collect();
         assert!(
-            appended.iter().any(|e| e.request_id == "c"),
-            "the line after the unterminated one must not be skipped"
+            ids.contains(&"b"),
+            "the unterminated line was consumed without being re-read: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"c"),
+            "the line after the unterminated one must not be skipped: {ids:?}"
         );
     }
 }

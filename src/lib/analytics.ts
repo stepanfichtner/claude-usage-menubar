@@ -50,14 +50,17 @@ export function formatTokens(tokens: number): string {
 }
 
 /**
- * A cost, with a trailing `+` whenever the bucket also holds tokens that
- * could not be priced.
+ * A cost, said only as precisely as it is known.
  *
- * The `+` is the whole reason this is a function and not a template string.
- * `$12.34` claims to be what those tokens cost; `$12.34+` claims only that
- * they cost at least that, which is the true statement whenever some of them
- * ran on a model this build has no price for. Rendering the first where the
- * second is true is the precise failure this tab has to avoid.
+ * Two roundings would otherwise state more than the number supports, and both
+ * are the reason this is a function rather than a template string:
+ *
+ * - `$12.34` claims to be what those tokens cost. When some of them ran on a
+ *   model this build has no price for, the only true statement is that they
+ *   cost at least that, so the figure carries a trailing `+`.
+ * - `$0.00` claims the bucket cost nothing, which is what a wholly unpriced
+ *   model would be shown as. A priced bucket that spent a third of a cent did
+ *   not cost nothing, so anything under half a cent reads `<$0.01`.
  */
 export function formatCost(cost: number, unpricedTokens = 0): string {
   const marker = unpricedTokens > 0 ? "+" : "";
@@ -130,19 +133,17 @@ export function unpricedModels(byModel: Bucket[]): Bucket[] {
  * thing is to name the first and last day the scan actually saw. `byDay`
  * arrives newest-first, hence the ends being taken the way round they are.
  *
- * The days are local calendar days: `analytics::summarize` buckets by the
- * user's timezone, not UTC, so this range means what it appears to mean.
+ * These are local calendar days: `analytics::summarize` buckets by the user's
+ * own timezone rather than UTC, so the range means what it appears to mean.
  *
- * `days` counts days *with usage*, not the length of the span: idle days have
- * no bucket, so the two differ and only the first claim is one this can make.
+ * Deliberately not a count of days. `byDay.length` counts days *with usage*,
+ * which is not the length of the span whenever a day was idle, and nothing
+ * renders it — a field that has to be explained before it can be read is
+ * better left out than shipped with a caveat.
  */
 export function coveredRange(
   byDay: Bucket[],
-): { first: string; last: string; days: number } | null {
+): { first: string; last: string } | null {
   if (byDay.length === 0) return null;
-  return {
-    first: byDay[byDay.length - 1].name,
-    last: byDay[0].name,
-    days: byDay.length,
-  };
+  return { first: byDay[byDay.length - 1].name, last: byDay[0].name };
 }

@@ -408,12 +408,20 @@ mod tests {
     /// Every model in the price table costs something, so a summary drawn only
     /// from priced models must report nothing unpriced anywhere.
     ///
-    /// What this catches that the two tests above do not is the classification
-    /// going wrong in the safe-looking direction: a *priced* model treated as
-    /// unpriced. Those tests only ever look at buckets they expect to be
-    /// unpriced, so a `cost_of` that returned `None` too eagerly would leave
-    /// them green while quietly emptying the estimate and papering it over
-    /// with a warning.
+    /// The narrow thing this catches, and the only one: `summarize`
+    /// classifying a *priced* model as unpriced, for some model other than
+    /// `claude-opus-5`. Every other test in this module makes its priced-side
+    /// assertions on `claude-opus-5` alone — `buckets_by_model_and_by_project`
+    /// does use haiku as well, but only asserts bucket counts and which bucket
+    /// sorts first, and haiku's cost falling to zero moves opus off the top of
+    /// neither list — so a `cost_of` that answered `None` for one particular
+    /// priced model would leave every one of them green.
+    ///
+    /// A blanket eager `None` is a different and much louder failure, already
+    /// caught above by the `total_cost` assertions in
+    /// `costs_each_token_class_at_its_own_rate`,
+    /// `an_unpriced_model_is_reported_rather_than_folded_into_the_total` and
+    /// `a_bucket_mixing_priced_and_unpriced_models_reports_both`.
     #[test]
     fn a_wholly_priced_summary_reports_nothing_unpriced() {
         let summary = summarize(&[
@@ -501,5 +509,60 @@ mod tests {
         assert_eq!(summary.by_project.len(), 1);
         assert_eq!(summary.by_day.len(), 1);
         assert_eq!(summary.unpriced_tokens, 2_000_000);
+    }
+
+    /// The one claim about day bucketing that no in-process test can make:
+    /// that `summarize` uses *this machine's* zone rather than UTC.
+    ///
+    /// Two things put it out of reach. `chrono` resolves the local zone once,
+    /// at first use, and caches it — setting `TZ` from inside the test process
+    /// does not move it, which is measured rather than assumed. And on a UTC
+    /// runner, which is what CI is, `Local` and `Utc` are the same function,
+    /// so nothing there can tell them apart anyway. Together those make the
+    /// `&Local` in `summarize` exactly the kind of line that stays green while
+    /// being wrong: `a_day_is_the_local_calendar_day_not_the_utc_one` pins how
+    /// `day_key` treats a zone, and the two bucketing tests build their
+    /// fixtures through `Local` and round-trip, so all three survive that line
+    /// being reverted to `&Utc`.
+    ///
+    /// So this re-runs the ignored test below in a child process, with `TZ`
+    /// fixed fourteen hours ahead, where the local date and the UTC date are
+    /// different days. `TZ` is given as a POSIX offset rather than an IANA
+    /// name so it needs no timezone database installed.
+    #[test]
+    fn the_day_zone_is_the_machines_own_not_utc() {
+        let binary = std::env::current_exe().expect("this test binary has a path");
+        let output = std::process::Command::new(binary)
+            .args([
+                "analytics::tests::a_day_is_bucketed_in_the_ambient_zone",
+                "--exact",
+                "--ignored",
+            ])
+            .env("TZ", "<+14>-14")
+            .output()
+            .expect("could not re-run this test binary");
+
+        assert!(
+            output.status.success(),
+            "summarize does not bucket by the machine's own zone:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Driven by `the_day_zone_is_the_machines_own_not_utc`, which re-runs it
+    /// with `TZ` fourteen hours ahead of UTC. Ignored by default because its
+    /// expectation holds in that zone and no other, so an ordinary run has
+    /// nothing to say about it.
+    #[test]
+    #[ignore = "re-run under a fixed TZ by the_day_zone_is_the_machines_own_not_utc"]
+    fn a_day_is_bucketed_in_the_ambient_zone() {
+        let mut e = entry("claude-opus-5", "alpha", 1_000_000, 0);
+        e.timestamp = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap();
+
+        let summary = summarize(&[e]);
+        assert_eq!(
+            summary.by_day[0].name, "2026-09-08",
+            "noon UTC is 02:00 the next day at UTC+14; \"2026-09-07\" is the UTC date"
+        );
     }
 }
