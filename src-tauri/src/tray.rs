@@ -345,11 +345,21 @@ fn title_for<R: Runtime>(
 /// alone leaves the same silence.
 ///
 /// Returns the title it rendered, or `None` when nothing has been stored yet
-/// and there is nothing to render. Returned because a test has no other way
-/// to see it: `MockRuntime` has no tray to read a title back from — the same
-/// `muda` constraint `current_quota_lines` exists for — so without this, a
-/// save that re-rendered the right title and a save that re-rendered nothing
-/// at all would look identical from the outside.
+/// and there is nothing to render. It means "this is the title that was
+/// computed", not "the menu bar now shows it": a `Some` comes back even when
+/// the lookup below finds no tray to push it at. Returned because a test has
+/// no other way to see it: `MockRuntime` has no tray to read a title back
+/// from — the same `muda` constraint `current_quota_lines` exists for — so
+/// without this, a save that re-rendered the right title and a save that
+/// re-rendered nothing at all would look identical from the outside.
+///
+/// Not race-free, and knowingly so. The poller is the other writer of this
+/// title, and it computes its own with `title_for` a moment before pushing
+/// it, so a save committing inside that window pushes the new title first
+/// and the poller's pre-save one lands second — the reported symptom again,
+/// until the next poll redraws it. The window is microseconds wide and opens
+/// once per poll interval; a generation counter, or rendering under the
+/// snapshot lock, would close it, and neither earns its machinery here.
 pub fn refresh_title<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
     let snapshot = current_snapshot(app)?;
     let title = title_for(app, &snapshot, Utc::now());
@@ -847,13 +857,15 @@ mod tests {
         );
     }
 
-    /// Every snapshot the poller renders has to land in `LastSnapshot`, not
-    /// just the successful poll: `apply` is the one point all three of its
-    /// render paths pass through — the cached replay at startup, a published
-    /// poll, and the empty snapshot the signed-out path renders — so the
-    /// numbers a later settings save re-renders are the numbers actually on
-    /// screen. The second half of this test is the one that matters: after
-    /// signing out, a save must not resurrect the quotas from before it.
+    /// Every snapshot `apply` renders lands in `LastSnapshot`, and each one
+    /// replaces the last — including the empty snapshot the signed-out path
+    /// renders, which is the second half here. `apply` is the one point all
+    /// three of the poller's render paths pass through (the cached replay at
+    /// startup, a published poll, that signed-out blank), so storing in it is
+    /// what covers all three. No save happens in this test: what a save then
+    /// makes of the stored snapshot is
+    /// `lib::tests::a_save_after_signing_out_does_not_bring_back_the_old_numbers`'s
+    /// to pin.
     ///
     /// Runs against a `MockRuntime` app, which has no tray, so `apply`
     /// returns at the lookup — the store therefore has to happen above it,

@@ -405,10 +405,18 @@ mod tests {
     }
 
     /// The reported bug, exactly: change which figures the menu bar shows,
-    /// save, and the menu bar does not change. Against the code before the
-    /// fix both saves rendered nothing at all — asking the poller for a fetch
-    /// that would eventually redraw the title was the only thing a save did
-    /// about it.
+    /// save, and the menu bar does not change. Observed as the title string
+    /// each save renders, because `MockRuntime` registers no tray to read one
+    /// back from. Against the code before the fix both saves rendered nothing
+    /// at all — asking the poller for a fetch that would eventually redraw the
+    /// title was the only thing a save did about it.
+    ///
+    /// Which leaves one line of the fix that no test here reaches: deleting
+    /// the `set_title` push inside `tray::refresh_title` leaves this suite
+    /// green. That is the constraint `current_quota_lines` and
+    /// `trailing_rows` already live with — `muda` refuses to build a menu off
+    /// the main thread, and no `#[test]` runs on it — and `apply`'s own push
+    /// has always sat in the same untested position.
     ///
     /// Both land inside the sixty-second manual-refresh window, which is the
     /// ordinary state of this app: opening the panel refreshes, and the
@@ -453,6 +461,46 @@ mod tests {
         );
     }
 
+    /// The two halves composed, which neither the store test in `tray` nor
+    /// the throttle test above does on its own: sign out, then save. The
+    /// signed-out path renders an empty snapshot, so the title a save
+    /// re-renders from the stored one has to be empty too — the quotas from
+    /// before the sign-out must not come back. Observed as the rendered title
+    /// string, for the reason given above.
+    ///
+    /// The first save is here to make the second mean something: it shows the
+    /// same call rendering the real figures a moment earlier, so an empty
+    /// answer at the end is the sign-out taking effect and not the harness
+    /// rendering nothing all along.
+    #[test]
+    fn a_save_after_signing_out_does_not_bring_back_the_old_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(Arc::new(tray::LastSnapshot::default()));
+
+        tray::apply(app.handle(), &published_snapshot());
+        let while_signed_in = set_settings_for(app.handle(), &title_settings(true, true)).unwrap();
+        assert_eq!(while_signed_in.as_deref(), Some("42% · 3h20m"));
+
+        // What `poller.rs` renders on the signed-out path: no quotas at all.
+        tray::apply(
+            app.handle(),
+            &model::UsageSnapshot {
+                quotas: Vec::new(),
+                fetched_at: chrono::Utc::now(),
+                stale: false,
+            },
+        );
+
+        let after_signing_out =
+            set_settings_for(app.handle(), &title_settings(true, true)).unwrap();
+        assert_eq!(
+            after_signing_out.as_deref(),
+            Some(""),
+            "the save must render the signed-out snapshot, not the numbers before it"
+        );
+    }
+
     /// The half of the old behaviour that was right and stays: a settings
     /// change is still a good moment to ask for fresh numbers. A
     /// `RefreshSignal` nothing has touched lets exactly one request through,
@@ -476,8 +524,10 @@ mod tests {
 
     /// Saving before the first poll has published anything — the settings
     /// window opens from the menu, which is available immediately — has no
-    /// numbers to render. That has to be an empty answer rather than a panic
-    /// or a blanked title.
+    /// numbers to render, and must answer with no title rather than panicking
+    /// on the absent snapshot. That the tray is then left alone rather than
+    /// blanked follows from `refresh_title` returning before it pushes
+    /// anything; it is not observed here.
     #[test]
     fn a_save_before_the_first_snapshot_renders_no_title() {
         let dir = tempfile::tempdir().unwrap();
