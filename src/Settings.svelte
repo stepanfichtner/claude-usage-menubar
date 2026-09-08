@@ -97,6 +97,18 @@
     return $snapshot?.snapshot.quotas.find((q) => q.id === quotaId)?.label ?? quotaId;
   }
 
+  // A limit the server is not giving a reset time for. The checkbox below still
+  // works — the moment a reset time appears the countdown starts showing — but
+  // until then ticking it produces nothing visible, and an option that silently
+  // does nothing is the thing this window has twice been fixed for. So it stays
+  // enabled and says why instead of being hidden or unticked: hiding it would
+  // make it appear and vanish as the server's answer changes, and unticking it
+  // would throw away a choice the user made for when it does work.
+  function hasNoResetTime(quotaId: string): boolean {
+    const quota = $snapshot?.snapshot.quotas.find((q) => q.id === quotaId);
+    return quota !== undefined && !quota.resetsAt;
+  }
+
   // Built entirely from data this window already holds — the subscribed
   // snapshot plus the checkboxes below — so it costs no extra command or
   // round trip. `renderTitle` (src/lib/titlePreview.ts) mirrors
@@ -259,6 +271,12 @@
                   <input type="checkbox" bind:checked={entry.showCountdown} />
                   Time until reset
                 </label>
+                {#if hasNoResetTime(entry.quotaId)}
+                  <p class="quota-note">
+                    No reset time reported for this limit yet, so this shows
+                    nothing for now.
+                  </p>
+                {/if}
               </div>
             {/each}
           </div>
@@ -402,6 +420,12 @@
        window the user can drag taller, beats two nested ones sized for a
        guess about how many quotas the API returns. */
     padding-right: 2px;
+  }
+  .quota-note {
+    margin: 2px 0 0 24px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--fg-muted);
   }
   .quota-group {
     border: 1px solid var(--border);
