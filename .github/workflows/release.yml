@@ -45,9 +45,14 @@ jobs:
   # the human-facing .dmg; the updater fetches the .app.tar.gz + signature,
   # never the .dmg, so this can never break an update. If the macOS job goes
   # red here, re-run just that job — it is not a regression.
-  # Linux is built and tested on every push by ci.yml, but no one has run it
-  # on real hardware yet, so releases are macOS only. The leg comes back once
-  # the Ubuntu verification passes — see the README's Ubuntu section.
+  # The ubuntu-22.04 leg produces artifacts; it does not verify them. ci.yml
+  # has always compiled this code and run its tests on Ubuntu, but nobody has
+  # launched the result on real hardware, and the Linux credential path
+  # (`~/.claude/.credentials.json`) is still an unconfirmed assumption — if it
+  # is wrong the app cannot sign in at all. The leg is here so the first person
+  # to try Linux has something to install and report back on, not because Linux
+  # is supported. The README's Ubuntu section tells whoever downloads it the
+  # same thing, and the two are meant to stay in step.
   build:
     needs: guard
     # The only job in either workflow that needs a write token: it creates the
@@ -62,11 +67,26 @@ jobs:
           - os: macos-latest
             args: "--target universal-apple-darwin"
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - os: ubuntu-22.04
+            args: ""
+            rust-targets: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+
+      # Same list as ci.yml's Ubuntu job, and for the same reason: webkit2gtk
+      # and libayatana-appindicator are what the app links against, and
+      # patchelf/librsvg/file/wget are what the AppImage bundler shells out to.
+      # No `uses:` here on purpose — plain apt-get needs no third-party action,
+      # so this step adds nothing new to pin.
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libxdo-dev libssl-dev
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head, 2026-09-03
         with:

@@ -8,9 +8,10 @@ The limits are account-wide, so one glance covers every Claude Code project and
 the Claude desktop app at once. That is the whole reason it exists: running several
 projects plus the desktop app, there is otherwise nowhere to see the total.
 
-macOS today. The codebase already builds and passes its tests on Ubuntu in CI,
-but releases are macOS only — nobody has run it on real Linux hardware yet. See
-the Ubuntu section below.
+macOS is the platform this has actually been run on. Releases now also carry an
+Ubuntu AppImage and a `.deb`, but nobody has launched either on real Linux
+hardware — they exist so that a first Linux user can, and can say what happened.
+Read the Ubuntu section below before you install one.
 
 <p align="center">
   <img src=".github/images/menubar.png" alt="The menu bar item at four severities, with each separator option" width="456">
@@ -126,28 +127,78 @@ it rather than find out.
 
 ### Ubuntu
 
-Not published. The Linux build compiles and its full test suite passes in CI
-on every push (see `ci.yml`), but no one has run it on real Ubuntu hardware,
-so no release includes a `.deb` or an AppImage.
+Releases include an AppImage and a `.deb`. **Nobody has run either of them on
+real Linux hardware.** The code compiles and its full test suite passes on
+Ubuntu in CI on every push (see `ci.yml`), and the release workflow now builds
+the two bundles from it — that is the whole of the evidence. Compiling is not
+running. If you install one of these, you are the person finding out whether
+this app works on Linux, and the rest of this section is written on that
+assumption.
 
-The specific risk, not just an unticked checkbox: on macOS this app reads the
-OAuth token from the Keychain. On Linux it instead reads
-`~/.claude/.credentials.json` directly — a path that was never confirmed
-against a real Claude Code installation. If that assumption is wrong, the app
-cannot sign in at all, and that would only surface on hardware nobody here has.
+**Take the AppImage.** Download it from [Releases](../../releases), make it
+executable, run it. Nothing to install and nothing to uninstall — the only trace
+it leaves is its settings file under
+`~/.local/share/com.stepanfichtner.claude-usage-menubar/`.
 
-If you want to try it, build from source (below) and run it on Ubuntu. A
-report back — it started, it read your credentials, the tray icon appeared,
-notifications fired — is what brings the `ubuntu-22.04` leg back to the
-release workflow.
+```bash
+chmod +x Claude.Usage_*.AppImage
+./Claude.Usage_*.AppImage
+```
 
-`bundle.targets` in `src-tauri/tauri.conf.json` lists only `dmg` and `app` to
-match that. The `bundle.linux.deb.depends` list next to it stays, though: those
-package names are researched knowledge that would be expensive to recover, and
-unlike `targets` they cause nothing to be built. They are waiting for the Linux
-leg, not left over from it. (The note lives here rather than beside them because
-Tauri parses `tauri.conf.json` as strict JSON with unknown keys rejected, so the
-file cannot hold a comment of its own.)
+The AppImage is also the build the in-app updater treats most simply: **Check
+for Updates…** downloads the new one and rewrites the file you ran, in place,
+with no privileges involved. The `.deb` is there for anyone who would rather
+have a real package, but its updates cost more — Tauri's updater installs a
+`.deb` by running `dpkg -i` under `pkexec`, so **every update raises a system
+password prompt**. That is the updater's design, not something this app can
+switch off, and it is better read here than met later. Neither Linux update path
+has been exercised any more than the rest of this, and the `.deb`'s is the one
+with more moving parts, which is the second reason to take the AppImage.
+
+**The thing most likely to be wrong.** On macOS this app reads the OAuth token
+from the Keychain, via `/usr/bin/security`. There is no Keychain in the Linux
+path, so it instead reads `~/.claude/.credentials.json` directly and takes
+`claudeAiOauth.accessToken` out of it. That filename, that location and that
+shape were never confirmed against a real Claude Code install on Linux — they
+are an assumption carried across from macOS. If any part of it is wrong, the app
+cannot sign in at all and every figure stays empty. This is the specific failure
+this section exists to warn you about, and the first thing to check if nothing
+appears.
+
+**First run, in this order:**
+
+1. `cat ~/.claude/.credentials.json` — does the file exist, and does it hold a
+   `claudeAiOauth` object with an `accessToken` inside? If it does not, stop and
+   report what you found instead. That answer is worth more than everything
+   below it.
+2. Launch it. Does a tray icon appear? On stock GNOME the tray needs the
+   AppIndicator extension — `sudo apt install gnome-shell-extension-appindicator`,
+   then log out and back in.
+3. Do the figures agree with Claude Code's own `/usage`? Both read the same
+   endpoint, so they should match.
+4. Click the tray icon. Does the panel open, and does it show your account name
+   and plan?
+
+**Three things that are different on Linux by design.** They are not bugs, so
+please do not file them as bugs — but do say if you hit something that is not on
+this list:
+
+- **The tray icon has no tooltip.** Setting one is a no-op in the AppIndicator
+  backend this app uses: `tray-icon`'s `set_tooltip` is documented "Linux:
+  Unsupported" and its GTK implementation returns success without doing
+  anything. The tray menu label carries the same text and is reliable.
+- **Notifications need a notification daemon** on your D-Bus session. A full
+  GNOME or KDE desktop runs one; a minimal window manager may not, and the app
+  cannot tell the difference — the call reports success either way.
+- **The panel opens in the centre of the screen**, not under the tray icon. On
+  macOS it is positioned against the menu bar item; there is no equivalent
+  anchor on Linux, so it is centred deliberately.
+
+**Report back in [Issues](../../issues)** — your distro and desktop, which
+artifact you used, and how far down that checklist you got before something
+broke, or that nothing did. That report is the only thing that moves Linux from
+"we built it" to "it works". Every hedge above is there because no one has sent
+one yet; the first one that arrives is what lets the hedging come out.
 
 ## Updating
 
@@ -271,11 +322,13 @@ git tag v0.2.0 && git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` refuses the tag unless it is on `main` and
-matches `Cargo.toml`, then builds macOS (universal `.dmg` + `.app`) and
-publishes a draft GitHub release with `latest.json` for the in-app updater
-attached. The Ubuntu leg stays disabled — see the Ubuntu section under
-Install — and returns to this workflow once someone has verified the Linux
-build on real hardware.
+matches `Cargo.toml`, then builds on two legs — macOS (universal `.dmg` +
+`.app`) and Ubuntu (AppImage + `.deb`) — and publishes a draft GitHub release
+with `latest.json` for the in-app updater attached. The two legs do not carry
+equal weight: the macOS artifacts are the ones anyone has run, and the Ubuntu
+ones are there to be tried for the first time. The Ubuntu section under Install
+says so to whoever downloads them, and should keep saying so until a report
+comes back.
 
 `"createUpdaterArtifacts": true` in `src-tauri/tauri.conf.json` is what makes
 that last part work: it is the switch that tells `tauri build` to emit the
