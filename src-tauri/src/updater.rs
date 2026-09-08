@@ -103,9 +103,12 @@ fn short_reason(reason: &str) -> String {
 }
 
 /// How long a completed outcome stays in the menu label before falling back
-/// to idle. Checked lazily whenever the label is read — `tray::apply`
-/// rebuilds the menu on every poll, so that read already happens regularly
-/// enough that no separate timer is needed to clear it.
+/// to idle. Checked lazily whenever the label is read — `tray::apply` reads
+/// it on every poll, so that read already happens regularly enough that no
+/// separate timer is needed to clear it. The read is what expires the
+/// outcome, and the expiry then shows up as a changed label, which is what
+/// makes `apply` rebuild the menu that poll: it skips a rebuild only when
+/// this label *and* the quota lines are both unchanged (`tray::LastMenu`).
 const OUTCOME_VISIBLE_FOR: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default)]
@@ -468,11 +471,12 @@ mod tests {
     }
 
     /// The requirement R51 exists for: `tray::apply` rebuilds the whole
-    /// menu on every poll, so if the label were derived once and baked into
-    /// the menu rather than read fresh from this state, the very next poll
-    /// — seconds later — would silently wipe it. Reading the label twice in
-    /// a row, simulating two such rebuilds while the outcome is still
-    /// fresh, must return the same text both times.
+    /// menu whenever its content moves, so if the label were derived once
+    /// and baked into the menu rather than read fresh from this state, the
+    /// next rebuild — which a poll a few seconds later can trigger — would
+    /// silently wipe it. Reading the label twice in a row, simulating two
+    /// such rebuilds while the outcome is still fresh, must return the same
+    /// text both times.
     /// Two clicks on `Check for Updates…` in quick succession used to give
     /// two concurrent `download_and_install` calls writing the same
     /// `/Applications` bundle, and then two `app.restart()`. `spawn_check`

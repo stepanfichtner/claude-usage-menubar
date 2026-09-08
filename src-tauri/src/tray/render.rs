@@ -157,10 +157,10 @@ pub(crate) enum MenuRow {
 /// actually ships, not a description that could drift from it.
 ///
 /// `check_updates_label` is a parameter rather than a literal here because
-/// `tray::apply` calls `build_menu` fresh on every poll: the label has to be
-/// derived from `updater::UpdateCheckStatus` at each rebuild (see that
-/// module), or the very next poll — seconds later — would silently wipe
-/// whatever a check just reported.
+/// the label has to be derived from `updater::UpdateCheckStatus` at each
+/// rebuild (see that module), not baked in once: `tray::apply` rebuilds
+/// whenever the menu's content moves, so a stale literal would be pushed
+/// over whatever a check had just reported.
 pub(crate) fn trailing_rows(check_updates_label: String) -> Vec<MenuRow> {
     use MenuRow::{Item, Separator};
     vec![
