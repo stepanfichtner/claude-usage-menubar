@@ -251,6 +251,14 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // Registered for `updater.rs`'s dialogs, which are the only dialogs
+        // this app opens. `DialogExt::dialog()` reads this plugin's managed
+        // state, so without the registration `app.dialog()` panics; but the
+        // registration alone is the whole requirement — a Rust-side dialog
+        // never passes through `invoke_handler`, so it needs no entry in
+        // `capabilities/default.json` (reasoning and sources in the
+        // `updater` module doc comment).
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

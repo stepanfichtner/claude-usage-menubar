@@ -27,6 +27,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sy
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 thiserror = "2"
 dirs = "7"
+tauri-plugin-dialog = "2.7"
 
 [dev-dependencies]
 wiremock = "0.6"
