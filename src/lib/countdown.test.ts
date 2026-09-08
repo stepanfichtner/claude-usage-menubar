@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCompact, formatLong } from "./countdown";
+import { formatCompact, formatLong , formatResetTime } from "./countdown";
 
 const now = new Date("2026-09-07T09:00:00Z");
 const ahead = (minutes: number) =>
@@ -83,5 +83,39 @@ describe("formatCompact", () => {
   it("reads as now once the reset has passed", () => {
     expect(formatCompact(ahead(-5), now)).toBe("now");
     expect(formatCompact(ahead(0), now)).toBe("now");
+  });
+});
+
+describe("formatResetTime", () => {
+  /** The weekday is ours, the clock is the machine's. Both halves asserted,
+   *  because the fix is a split decision and either half alone would be wrong:
+   *  forcing the locale outright would turn this user's 16:19 into 04:19 PM,
+   *  and leaving it alone put a Czech "út" inside an otherwise English string.
+   *
+   *  What this does NOT catch: reverting `"en"` to `undefined`. Vitest runs
+   *  under Node's default locale, which is English, so the reverted code
+   *  produces the same output here and the assertion stays green. It bites on
+   *  the format — the word order, the separator, a switched weekday style —
+   *  not on the locale argument. Pinning that would need a child process with
+   *  `LC_ALL` set, the way the analytics day-zone test does it for `TZ`, and
+   *  for one word in one string that is more machinery than the risk earns.
+   */
+  it("names the weekday in English and leaves the time to the system", () => {
+    const iso = "2026-09-08T16:19:00Z";
+    const out = formatResetTime(iso);
+    const systemTime = new Date(iso).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    expect(out).toBe(`resets Tue ${systemTime}`);
+  });
+
+  /** Czech is reachable from this runner, so the assertion above is a statement
+   *  about our choice rather than an accident of what ICU happens to ship. */
+  it("could have said út, and does not", () => {
+    const iso = "2026-09-08T16:19:00Z";
+    expect(new Date(iso).toLocaleDateString("cs", { weekday: "short" })).toBe("út");
+    expect(formatResetTime(iso)).not.toContain("út");
   });
 });

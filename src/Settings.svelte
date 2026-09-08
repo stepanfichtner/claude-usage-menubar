@@ -280,6 +280,11 @@
 {/if}
 
 <style>
+  /* The window scrolls its content, never its Save button. `main` itself does
+     not scroll — `.columns` does — so the footer stays on screen however many
+     quotas there are. It used to sit below the columns inside one scrolling
+     box, which put Save under the fold exactly when someone had enough quotas
+     to want it. */
   main {
     box-sizing: border-box;
     height: 100vh;
@@ -287,13 +292,19 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
-    overflow-y: auto;
+    overflow: hidden;
   }
   .columns {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 20px;
     align-items: start;
+    /* `min-height: 0` is what actually lets this shrink inside the flex
+       column; without it a grid child refuses to go below its content and
+       scrolls the whole window instead. */
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
   .panel {
     box-sizing: border-box;
@@ -384,17 +395,13 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    /* Fits the two default quotas with a little headroom to spare — the
-       extra bottom padding means that headroom is unused blank space, not a
-       border sitting flush against the cap. A third or fourth (the API can
-       return up to four: session plus three weekly variants) scrolls within
-       this list rather than resizing the window around an uncommon case; no
-       fade on the edge, since a partially visible header on a scrolled-past
-       group is the one cue this list has that there's more below it. */
-    max-height: 200px;
-    overflow-y: auto;
+    /* No cap and no scroll of its own. This list used to stop at 200px and
+       scroll inside a window that also scrolled, so a third quota put the
+       reader in a box inside a box — and the outer one had already pushed
+       Save under the fold. One scroll region for the whole window, and a
+       window the user can drag taller, beats two nested ones sized for a
+       guess about how many quotas the API returns. */
     padding-right: 2px;
-    padding-bottom: 8px;
   }
   .quota-group {
     border: 1px solid var(--border);

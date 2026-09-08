@@ -29,11 +29,13 @@
       {
         "label": "settings",
         "url": "settings.html",
-        "title": "Claude Usage — Settings",
+        "title": "Claude Usage \u2014 Settings",
         "width": 660,
-        "height": 520,
-        "resizable": false,
-        "visible": false
+        "height": 600,
+        "resizable": true,
+        "visible": false,
+        "minWidth": 560,
+        "minHeight": 420
       }
     ],
     "security": {
@@ -42,10 +44,25 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app"],
+    "targets": [
+      "dmg",
+      "app"
+    ],
     "createUpdaterArtifacts": true,
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.ico"],
-    "linux": { "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] } }
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1"
+        ]
+      }
+    }
   },
   "plugins": {
     "updater": {

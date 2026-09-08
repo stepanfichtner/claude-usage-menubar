@@ -32,7 +32,12 @@ export function formatCompact(resetsAt: string, now: Date): string {
 /** "resets Sat 10:29" — the absolute time beneath the countdown. */
 export function formatResetTime(resetsAt: string): string {
   const date = new Date(resetsAt);
-  const weekday = date.toLocaleDateString(undefined, { weekday: "short" });
+  // "en" rather than the system locale: every other word in this interface is
+  // English, so a Czech or German weekday inside "resets … 16:19" reads as a
+  // bug rather than as localisation. The *time* below stays on the system
+  // locale deliberately — 24-hour vs AM/PM is a real preference the OS already
+  // knows, and overriding it would be the actual regression.
+  const weekday = date.toLocaleDateString("en", { weekday: "short" });
   const time = date.toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
