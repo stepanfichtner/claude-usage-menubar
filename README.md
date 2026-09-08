@@ -106,11 +106,14 @@ this repository's release pipeline. That pipeline pins every CI action to a
 commit hash and signs every update with a key held only in GitHub secrets, which
 is the most that can be offered without an Apple Developer ID.
 
-Verify the download if you like — the SHA-256 of each release artifact is
-published in its release notes:
+Verify the download if you like. Once both build legs have uploaded, the release
+workflow downloads every artifact back off the release, hashes it, and appends a
+**SHA-256** block to that release's notes — so the list describes the exact bytes
+you just fetched, not something built alongside them. Compare yours against it:
 
 ```bash
-shasum -a 256 ~/Downloads/Claude.Usage_*_universal.dmg
+shasum -a 256 ~/Downloads/Claude.Usage_*_universal.dmg   # macOS
+sha256sum ~/Downloads/Claude.Usage_*.AppImage            # Linux
 ```
 
 On first run macOS may ask for permission to read the `Claude Code-credentials`
@@ -203,27 +206,43 @@ one yet; the first one that arrives is what lets the hedging come out.
 ## Updating
 
 If you installed a release build, choose **Check for Updates…** from the tray
-menu. It downloads and installs any newer release and restarts the app. The
-moment you click it, that same menu item's own label becomes the answer:
-**Checking for updates…** right away, then **Up to date (vX.Y.Z)**, **Update
-available — installing…**, or **Check failed —** followed by a short reason,
-for about 30 seconds, before returning to normal. **The menu label is the
-channel this feature depends on** — it is the one thing here that this app
-fully controls, so it is where the outcome reliably shows up, immediately,
-without waiting for anything else to happen in the background.
+menu. Whatever the check finds, it tells you in a dialog:
 
-The app also tries to show a system notification with the same outcome —
-unless you have turned notifications off in Settings, which silences this one
-too — and echoes it onto the tray icon's tooltip, but both are courtesies on
-top of the label, not something to rely on instead of it: the notification plugin
-this app uses cannot report whether a notification was ever actually
-displayed (notification permission can be revoked, or a minimal Linux
-desktop may have no notification daemon at all, and either way the call
-still reports success regardless), and on Ubuntu specifically the tooltip is
-a documented no-op in the AppIndicator backend this app uses, so it never
-actually appears there at all. If you ever see the notification or the
-tooltip, treat it as a bonus; the menu label is the one that is always
-right.
+- **A newer version is available.** "Update available", naming both the version
+  you are running and the one on offer, and saying the app will restart to
+  finish installing. **Update** proceeds; **Cancel** — or Escape, or dismissing
+  the alert — declines. Nothing is downloaded until you press Update: finding an
+  update and fetching it are two separate steps, and your answer is what
+  separates them.
+- **You are already current.** "You're up to date", naming the version you are
+  running.
+- **Something went wrong.** "Update failed", carrying the reason in full.
+
+Press Update and the app downloads the new bundle, installs it, and restarts
+itself. The restart is the part you cannot take back, which is why the dialog
+says so before you agree rather than after. Cancel costs nothing and leaves the
+menu item ready for the next click.
+
+**The menu label is the fallback channel**, behind the dialog rather than in
+front of it. The moment you click, that same item reads **Checking for
+updates…**, and afterwards **Up to date (vX.Y.Z)**, **Update available —
+installing…**, or **Check failed —** and a shortened reason, for about 30
+seconds before returning to normal. It is worth having because it is the one
+channel this app fully controls — it needs no permission, no daemon and no
+window — so it still tells the truth if a dialog was dismissed unread. (Cancel
+skips all of that and returns the label straight to idle.)
+
+Exactly one system notification survives, and it is the install: "Installing
+version X — restarting…". The other two outcomes now raise a dialog while you
+are sitting in front of the app, so a banner repeating them a second later
+would be noise. The install keeps its banner because that outcome can land
+minutes after your click, with you gone — but do not build on it. It is raced
+against the very restart it announces, it is silenced if you have turned
+notifications off in Settings, and the notification plugin cannot report whether
+anything was ever actually displayed (a revoked permission, or a minimal Linux
+desktop with no notification daemon, both still return success). The tray
+tooltip echoes every outcome as well, and on Ubuntu that echo is a documented
+no-op — see the Ubuntu section above. Treat both as a bonus.
 
 If you're running from a source checkout instead:
 
@@ -328,7 +347,14 @@ with `latest.json` for the in-app updater attached. The two legs do not carry
 equal weight: the macOS artifacts are the ones anyone has run, and the Ubuntu
 ones are there to be tried for the first time. The Ubuntu section under Install
 says so to whoever downloads them, and should keep saying so until a report
-comes back.
+comes back. The draft's body repeats that warning, because plenty of people
+reach a releases page without ever reading a README.
+
+A third job, `checksums`, then runs once both legs are done: it pulls every
+uploaded asset back down, hashes it, and appends a SHA-256 block to the draft's
+notes. It is a separate job rather than a step in each leg because two legs
+appending to one body concurrently is a lost-update race. Re-running it is safe —
+it replaces its own previous block rather than stacking another.
 
 `"createUpdaterArtifacts": true` in `src-tauri/tauri.conf.json` is what makes
 that last part work: it is the switch that tells `tauri build` to emit the

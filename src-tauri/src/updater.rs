@@ -551,6 +551,18 @@ fn tooltip_line(title: &str, body: &str) -> String {
 /// public field back, and a stalled download would run unbounded — the exact
 /// wedge this constant exists to prevent, in the half of the flow where a
 /// stall is most likely.
+///
+/// **That assignment is not covered by any test, and deleting it leaves the
+/// suite green** (checked, not assumed: 238 passed with the line removed).
+/// This module has a history of claiming coverage it did not have, so the gap
+/// is written down rather than left to be rediscovered. It is not laziness —
+/// the plugin's `Update` carries two private fields, `extract_path` and
+/// `context` (`updater.rs:669-671`), and exposes no constructor, so a test
+/// cannot build one to assert the field on. The only route that reaches a real
+/// `Update` is a wiremock end-to-end run, and observing the timeout there means
+/// stalling a download for the full 300 seconds. Both costs are worse than the
+/// note. If you delete the line as redundant, nothing will fail; re-read the
+/// paragraph above before you do.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One check, from the network request to the install, with the "do you want

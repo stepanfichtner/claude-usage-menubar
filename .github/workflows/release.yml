@@ -53,6 +53,14 @@ jobs:
   # to try Linux has something to install and report back on, not because Linux
   # is supported. The README's Ubuntu section tells whoever downloads it the
   # same thing, and the two are meant to stay in step.
+  #
+  # One consequence to watch on the first run: `bundle.targets` in
+  # tauri.conf.json is global, so the macOS leg now requests `deb` and
+  # `appimage` too. The bundler is expected to intersect the requested targets
+  # with what the host platform can actually produce, which is not something
+  # this checkout can prove. `fail-fast: false` is what makes that safe to find
+  # out: if macOS trips over it, the Ubuntu leg still finishes and uploads. If
+  # it does trip, split `targets` per platform rather than dropping either leg.
   build:
     needs: guard
     # The only job in either workflow that needs a write token: it creates the
@@ -152,11 +160,89 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Claude Usage ${{ github.ref_name }}
+          # Someone can land on this page without ever seeing the README, so
+          # the Linux hedge has to travel with the artifacts rather than only
+          # live in the repo. SHA-256 lines are appended to this body by the
+          # `checksums` job once both legs have uploaded.
           releaseBody: |
             Unsigned builds. On macOS, right-click the app and choose Open, or run
             `xattr -dr com.apple.quarantine "/Applications/Claude Usage.app"`.
+
+            **Linux — please read before installing.** The `.AppImage` and `.deb`
+            here have never been run on real hardware by anyone. Prefer the
+            AppImage: `chmod +x` it and run it, and the in-app updater replaces it
+            in place. The `.deb` installs updates through `pkexec`, so it asks for
+            your password every time. The app reads `~/.claude/.credentials.json`
+            on Linux and that path is unconfirmed — if it is wrong, sign-in fails
+            outright. See the README's Ubuntu section, and please report back.
 
             ${{ steps.notes.outputs.notes }}
           releaseDraft: true
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # The README tells readers to verify their download against a SHA-256 in the
+  # release notes. Until this job existed that was simply false — nothing
+  # emitted checksums and no manual step was written down anywhere. For an
+  # unsigned binary the checksum is the only thing a downloader can actually
+  # check, so the fix is to make the sentence true rather than to delete it.
+  #
+  # A separate job, not a step inside `build`, because `build` is a matrix of
+  # two: appending to the release body from both legs at once is a
+  # read-modify-write race, and the loser's checksums vanish silently. `needs:
+  # build` makes this the single writer, after every artifact is uploaded.
+  #
+  # It hashes the assets **downloaded back from the release**, not the local
+  # build output, so what is published describes the exact bytes a user gets.
+  #
+  # This is the second job holding `contents: write`, which was previously true
+  # of `build` alone — editing a release body cannot be done with a read-only
+  # token. It is a deliberately small widening: this job checks out no code,
+  # uses no third-party action (so it adds nothing to pin), and is never given
+  # the signing key. Keep it that way.
+  checksums:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Append SHA-256 checksums to the release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          workdir=$(mktemp -d)
+          cd "$workdir"
+
+          # Drafts are reachable by tag here because the tag push is what
+          # triggered this workflow, so the ref already exists.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::no release assets found for $TAG — refusing to publish an empty checksum block"
+            exit 1
+          fi
+
+          SUMS=$(sha256sum * | sort -k2)
+          echo "$SUMS"
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > body.md
+
+          # Idempotent: a re-run (the macOS leg has a known create-dmg flake and
+          # gets re-run by hand) must replace the previous block, not stack a
+          # second one under it. First awk drops everything from our own marker
+          # onward; second drops trailing blank lines, without which each re-run
+          # would leave one more of them behind. Deliberately not `sed -i`: that
+          # needs an argument on BSD and none on GNU, and this was written on a
+          # Mac. Verified by running the pair four times over its own output —
+          # one block, one blank line, byte-identical every time.
+          awk '/^## SHA-256$/{exit} {print}' body.md \
+            | awk 'NF{while(b>0){print "";b--} print; next} {b++}' > trimmed.md
+
+          {
+            cat trimmed.md
+            printf '\n## SHA-256\n\n```\n%s\n```\n' "$SUMS"
+          } > new-body.md
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file new-body.md
