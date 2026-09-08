@@ -155,11 +155,15 @@ fn profile_is_due(
 /// off by one iteration: it missed a rate limit that started on *this* very
 /// poll, since `on_rate_limited()` would not fold it in until `decide()` ran
 /// afterwards. Reading `result` directly closes that gap.
+///
+/// `retry_not_before` is R57's term: the hold `profile_retry_after` puts on
+/// the endpoint after the *profile* fetch itself fails.
 fn should_fetch_profile(
     result: &Result<Vec<Quota>, ApiError>,
     backoff: &Backoff,
     retrying_auth: bool,
     fetched_at: Option<DateTime<Utc>>,
+    retry_not_before: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
     // The retry pass: the one `Decision::RetryAuthOnce` sent straight back
@@ -171,12 +175,90 @@ fn should_fetch_profile(
     if retrying_auth {
         return false;
     }
+    // R57. Nothing else here can see a failed profile fetch: a failure
+    // leaves `fetched_at` exactly as stale as it was and touches neither
+    // `result` nor `backoff`, both of which are the *usage* poll's. So
+    // staleness alone re-asked on every single poll for as long as the
+    // profile endpoint kept failing — sixty requests an hour at the interval
+    // floor, at an endpoint already known to rate-limit.
+    if retry_not_before.is_some_and(|at| now < at) {
+        return false;
+    }
     let rate_limited_now = matches!(result, Err(ApiError::RateLimited));
     profile_is_due(
         rate_limited_now || backoff.is_backing_off(),
         fetched_at,
         now,
     )
+}
+
+/// When the profile endpoint may be asked again after this attempt: `None`
+/// once it answers, otherwise a point far enough out to stop the refetch
+/// loop above.
+///
+/// The escalation is `Backoff`'s, not a second mechanism — the same
+/// `BACKOFF_STEPS` the usage poll walks (2, 5, then 15 minutes), advanced by
+/// a failure and cleared by a success. `next_delay`'s `base` argument is
+/// what it answers with after *zero* failures, and this is only ever
+/// consulted after one, so the zero passed for it is never the value that
+/// comes back.
+fn profile_retry_after(
+    backoff: &mut Backoff,
+    succeeded: bool,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if succeeded {
+        backoff.on_success();
+        return None;
+    }
+    backoff.on_rate_limited();
+    let delay = backoff.next_delay(Duration::ZERO).as_secs() as i64;
+    Some(now + ChronoDuration::seconds(delay))
+}
+
+/// Stamps every snapshot this poller emits with a `fetched_at` distinct
+/// from the one before it.
+///
+/// R58, and a cross-language invariant: the settings window counts each
+/// snapshot exactly once when deciding whether a title entry's quota has
+/// been absent long enough to retire, and it identifies snapshots by
+/// `fetchedAt` alone (`titleEntries.ts`'s `reconcileTitleEntries`). Two
+/// emits sharing a stamp are therefore counted as one — the absence tally
+/// stops advancing and a genuinely retired quota's row never goes away.
+///
+/// `Utc::now()` on its own left that resting on the platform clock's
+/// resolution rather than on anything in this codebase, and it is not true
+/// at all across a clock stepped backwards by an NTP correction. This makes
+/// it true by construction instead.
+#[derive(Debug, Default)]
+struct SnapshotClock {
+    last: Option<DateTime<Utc>>,
+}
+
+impl SnapshotClock {
+    /// Seeded from the cached snapshot replayed at launch, when there is
+    /// one. That replay is an emit like any other as far as the frontend is
+    /// concerned, and its stamp comes from a previous process rather than
+    /// from this clock, so the first live snapshot has to be distinct from
+    /// it too.
+    fn after(previous: Option<DateTime<Utc>>) -> Self {
+        Self { last: previous }
+    }
+
+    /// One live snapshot, stamped `now` — or one nanosecond past the
+    /// previous stamp when `now` has not moved past it.
+    fn snapshot(&mut self, quotas: Vec<Quota>, now: DateTime<Utc>) -> UsageSnapshot {
+        let fetched_at = match self.last {
+            Some(last) if now <= last => last + ChronoDuration::nanoseconds(1),
+            _ => now,
+        };
+        self.last = Some(fetched_at);
+        UsageSnapshot {
+            quotas,
+            fetched_at,
+            stale: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +313,8 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::new();
         let mut backoff = Backoff::new();
+        let mut profile_backoff = Backoff::new();
+        let mut profile_retry_at: Option<DateTime<Utc>> = None;
         let mut auth = AuthState::Ok;
         let mut retrying_auth = false;
         let mut notifier = Notifier::new();
@@ -245,9 +329,20 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         // genuine meaning of the flag. A live fetch below always publishes
         // with `stale: false`, and nothing in this loop sets it back to true
         // afterwards.
-        let mut profile = cache::load_profile(&cache_dir).map(|(p, _)| p);
-        let mut profile_fetched_at = cache::load_profile(&cache_dir).map(|(_, at)| at);
-        if let Some(cached) = cache::load_snapshot(&cache_dir) {
+        //
+        // Both files are read in one `spawn_blocking`, and the profile once
+        // rather than twice for the two halves of its tuple. These are
+        // `std::fs` reads on a task that shares its runtime with the
+        // analytics scan and every other async worker.
+        let dir = cache_dir.clone();
+        let (cached_profile, cached_snapshot) = tauri::async_runtime::spawn_blocking(move || {
+            (cache::load_profile(&dir), cache::load_snapshot(&dir))
+        })
+        .await
+        .unwrap_or((None, None));
+        let (mut profile, mut profile_fetched_at) = cached_profile.unzip();
+        let mut clock = SnapshotClock::after(cached_snapshot.as_ref().map(|s| s.fetched_at));
+        if let Some(cached) = cached_snapshot {
             crate::tray::apply(&app, &cached);
             emit(&app, &cached, &profile, false);
         }
@@ -255,7 +350,14 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
         let signal = app.state::<Arc<RefreshSignal>>().inner().clone();
 
         loop {
-            let token = credentials::read_token().ok();
+            // On macOS this shells out to `/usr/bin/security`, which can put
+            // a modal Keychain ACL prompt on screen and then wait for it —
+            // holding an async worker for as long as the dialog sits there
+            // unanswered. The blocking pool is where that belongs.
+            let token = tauri::async_runtime::spawn_blocking(credentials::read_token)
+                .await
+                .ok()
+                .and_then(|token| token.ok());
             let result = match &token {
                 Some(token) => usage::fetch_usage(&client, &config.base_url, token).await,
                 None => Err(crate::error::ApiError::SignedOut),
@@ -287,14 +389,19 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                 &backoff,
                 retrying_auth,
                 profile_fetched_at,
+                profile_retry_at,
                 Utc::now(),
             );
             if stale_profile {
                 if let Some(token) = &token {
-                    if let Ok(fresh) =
-                        profile_api::fetch_profile(&client, &config.base_url, token).await
-                    {
-                        let _ = cache::save_profile(&cache_dir, &fresh);
+                    let fetched =
+                        profile_api::fetch_profile(&client, &config.base_url, token).await;
+                    // R57: a failure holds the endpoint off rather than
+                    // letting the next poll ask again immediately.
+                    profile_retry_at =
+                        profile_retry_after(&mut profile_backoff, fetched.is_ok(), Utc::now());
+                    if let Ok(fresh) = fetched {
+                        save_profile(&cache_dir, &fresh).await;
                         profile_fetched_at = Some(Utc::now());
                         profile = Some(fresh);
                     }
@@ -306,13 +413,8 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
             match decision {
                 Decision::RetryAuthOnce => continue,
                 Decision::Publish => {
-                    let quotas = result.unwrap_or_default();
-                    let snapshot = UsageSnapshot {
-                        quotas,
-                        fetched_at: Utc::now(),
-                        stale: false,
-                    };
-                    let _ = cache::save_snapshot(&cache_dir, &snapshot);
+                    let snapshot = clock.snapshot(result.unwrap_or_default(), Utc::now());
+                    save_snapshot(&cache_dir, &snapshot).await;
 
                     crate::tray::apply(&app, &snapshot);
 
@@ -340,11 +442,7 @@ pub fn spawn(app: AppHandle, config: PollConfig) {
                     // retry — including the one the panel's own open-triggered
                     // refresh causes — which is not what `stale` is for.
                     if auth == AuthState::SignedOut {
-                        let empty = UsageSnapshot {
-                            quotas: Vec::new(),
-                            fetched_at: Utc::now(),
-                            stale: false,
-                        };
+                        let empty = clock.snapshot(Vec::new(), Utc::now());
                         crate::tray::apply(&app, &empty);
                         emit(&app, &empty, &profile, true);
                     }
@@ -391,6 +489,38 @@ async fn wait_for_next_poll(
             }
         }
     }
+}
+
+/// The two cache writes, on the blocking pool rather than on this task's
+/// async worker: both are `std::fs`, and the runtime they would otherwise
+/// occupy is shared with the analytics scan and every command the panel
+/// invokes.
+///
+/// Both discard their failure, and that swallow is deliberate rather than
+/// overlooked. This app has no log sink, and one cache write failing costs
+/// exactly one thing: at the *next* launch the panel and the menu bar are
+/// empty for one poll interval instead of showing the previous session's
+/// numbers — which is also what a first-ever launch looks like, and is
+/// undone by the first successful poll. Nothing the user entered is at
+/// stake, nothing else reads these files, and no action is available to
+/// them if they were told. Surfacing it would mean inventing a user-facing
+/// channel (a banner, a system notification) for a condition that is neither
+/// actionable nor harmful; the honest alternative to this comment is a log
+/// line, and there is nowhere to put one. If a sink ever appears, this is
+/// one of the places that wants it.
+async fn save_snapshot(dir: &std::path::Path, snapshot: &UsageSnapshot) {
+    let dir = dir.to_path_buf();
+    let snapshot = snapshot.clone();
+    let _ =
+        tauri::async_runtime::spawn_blocking(move || cache::save_snapshot(&dir, &snapshot)).await;
+}
+
+/// The profile half of `save_snapshot` above, with the same reasoning about
+/// both the blocking pool and the discarded failure.
+async fn save_profile(dir: &std::path::Path, profile: &Profile) {
+    let dir = dir.to_path_buf();
+    let profile = profile.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || cache::save_profile(&dir, &profile)).await;
 }
 
 fn emit(app: &AppHandle, snapshot: &UsageSnapshot, profile: &Option<Profile>, signed_out: bool) {
@@ -532,6 +662,7 @@ mod tests {
                 &backoff,
                 false,
                 None,
+                None,
                 Utc::now()
             ));
         }
@@ -546,6 +677,7 @@ mod tests {
                 &result,
                 &backoff,
                 false,
+                None,
                 None,
                 Utc::now()
             ));
@@ -565,6 +697,7 @@ mod tests {
                 &backoff,
                 false,
                 None,
+                None,
                 Utc::now()
             ));
         }
@@ -582,6 +715,7 @@ mod tests {
                 &backoff,
                 false,
                 Some(fetched_at),
+                None,
                 Utc::now()
             ));
         }
@@ -603,6 +737,7 @@ mod tests {
                 &backoff,
                 true,
                 None,
+                None,
                 Utc::now()
             ));
         }
@@ -618,8 +753,222 @@ mod tests {
                 &backoff,
                 false,
                 None,
+                None,
                 Utc::now()
             ));
+        }
+    }
+
+    /// R57: the profile endpoint's *own* failures back off.
+    ///
+    /// Nothing in `should_fetch_profile`'s other four inputs can see one. A
+    /// failed profile fetch leaves `fetched_at` exactly as stale as it was
+    /// and touches neither the usage `result` nor the usage `backoff`, so
+    /// before this the loop asked again on the very next poll, and on every
+    /// poll after that, for as long as the endpoint kept failing.
+    mod profile_retry_tests {
+        use super::*;
+
+        #[test]
+        fn repeated_failures_escalate_through_the_usage_poll_s_own_steps() {
+            let now = Utc::now();
+            let mut backoff = Backoff::new();
+            let after = |backoff: &mut Backoff| profile_retry_after(backoff, false, now);
+
+            assert_eq!(
+                after(&mut backoff),
+                Some(now + ChronoDuration::seconds(120))
+            );
+            assert_eq!(
+                after(&mut backoff),
+                Some(now + ChronoDuration::seconds(300))
+            );
+            assert_eq!(
+                after(&mut backoff),
+                Some(now + ChronoDuration::seconds(900))
+            );
+            assert_eq!(
+                after(&mut backoff),
+                Some(now + ChronoDuration::seconds(900)),
+                "and caps there rather than growing without bound"
+            );
+        }
+
+        /// The reset half, which is what keeps a single blip from holding
+        /// the endpoint off for a quarter of an hour: the success clears the
+        /// hold, and the *next* failure starts from the first step again
+        /// rather than resuming where the last run left off.
+        #[test]
+        fn a_success_clears_the_hold_and_the_escalation_with_it() {
+            let now = Utc::now();
+            let mut backoff = Backoff::new();
+            profile_retry_after(&mut backoff, false, now);
+            profile_retry_after(&mut backoff, false, now);
+
+            assert_eq!(profile_retry_after(&mut backoff, true, now), None);
+            assert_eq!(
+                profile_retry_after(&mut backoff, false, now),
+                Some(now + ChronoDuration::seconds(120))
+            );
+        }
+
+        /// The composition, which is the half R56 taught us not to leave
+        /// untested: a hold produced by `profile_retry_after` really does
+        /// suppress `should_fetch_profile` while it stands, and really does
+        /// stop suppressing it once it expires. Every other input here says
+        /// "due" — a clean poll, no usage backoff, no profile ever cached —
+        /// so the hold is the only thing under test.
+        #[test]
+        fn a_standing_hold_suppresses_the_fetch_until_the_moment_it_expires() {
+            let now = Utc::now();
+            let mut backoff = Backoff::new();
+            let retry_at = profile_retry_after(&mut backoff, false, now);
+            let result: Result<Vec<Quota>, ApiError> = Ok(vec![]);
+
+            assert!(
+                should_fetch_profile(&result, &Backoff::new(), false, None, None, now),
+                "with no hold at all, everything here says due"
+            );
+            assert!(!should_fetch_profile(
+                &result,
+                &Backoff::new(),
+                false,
+                None,
+                retry_at,
+                now + ChronoDuration::seconds(119)
+            ));
+            assert!(
+                should_fetch_profile(
+                    &result,
+                    &Backoff::new(),
+                    false,
+                    None,
+                    retry_at,
+                    now + ChronoDuration::seconds(120)
+                ),
+                "the hold is exclusive: the instant it names is already free"
+            );
+        }
+    }
+
+    /// R58: `fetched_at` is how the settings window tells one snapshot from
+    /// the next. `titleEntries.ts`'s `reconcileTitleEntries` counts each
+    /// snapshot exactly once towards retiring an absent quota's title entry,
+    /// and `fetchedAt` is the whole of that identity — so two emits sharing
+    /// a stamp count as one, the absence tally stalls, and a row for a quota
+    /// the user no longer has never goes away.
+    ///
+    /// A frozen clock is the case `Utc::now()` cannot answer for by itself:
+    /// two readings landing inside one tick of whatever the platform's clock
+    /// resolution happens to be.
+    mod snapshot_clock_tests {
+        use super::*;
+
+        #[test]
+        fn two_snapshots_stamped_from_one_reading_still_differ() {
+            let frozen = Utc::now();
+            let mut clock = SnapshotClock::default();
+
+            let first = clock.snapshot(Vec::new(), frozen).fetched_at;
+            let second = clock.snapshot(Vec::new(), frozen).fetched_at;
+            assert!(second > first, "{first} then {second}");
+        }
+
+        /// The run, not just the pair: five emits inside one tick have to be
+        /// five distinct stamps, or a quota needs more than
+        /// `RETIREMENT_MISSES` absences to retire.
+        #[test]
+        fn a_run_of_snapshots_from_one_reading_is_strictly_increasing() {
+            let frozen = Utc::now();
+            let mut clock = SnapshotClock::default();
+
+            let stamps: Vec<DateTime<Utc>> = (0..5)
+                .map(|_| clock.snapshot(Vec::new(), frozen).fetched_at)
+                .collect();
+            assert!(
+                stamps.windows(2).all(|pair| pair[0] < pair[1]),
+                "{stamps:?}"
+            );
+        }
+
+        /// An NTP correction stepping the clock backwards must not hand out
+        /// a stamp the frontend has already counted — the one case where
+        /// `Utc::now()` is not merely unproven but actually wrong.
+        #[test]
+        fn a_clock_that_steps_backwards_still_yields_a_later_stamp() {
+            let now = Utc::now();
+            let mut clock = SnapshotClock::default();
+
+            let first = clock.snapshot(Vec::new(), now).fetched_at;
+            let second = clock
+                .snapshot(Vec::new(), now - ChronoDuration::hours(1))
+                .fetched_at;
+            assert!(second > first, "{first} then {second}");
+        }
+
+        /// A clock that does move is reported verbatim: the nudge above is
+        /// for a stalled clock only and must not accumulate into drift, or
+        /// the age the panel shows would creep away from the truth.
+        #[test]
+        fn an_advancing_clock_is_stamped_verbatim() {
+            let now = Utc::now();
+            let later = now + ChronoDuration::seconds(60);
+            let mut clock = SnapshotClock::default();
+
+            assert_eq!(clock.snapshot(Vec::new(), now).fetched_at, now);
+            assert_eq!(clock.snapshot(Vec::new(), later).fetched_at, later);
+        }
+
+        /// The cached snapshot replayed at launch is an emit like any other
+        /// as far as the settings window is concerned, and its stamp comes
+        /// from a previous process rather than from this clock. So the first
+        /// live snapshot has to be distinct from that one too — which is
+        /// what `SnapshotClock::after` is for.
+        #[test]
+        fn the_first_live_stamp_differs_from_the_replayed_cache_snapshot() {
+            let cached = Utc::now();
+            let mut clock = SnapshotClock::after(Some(cached));
+
+            assert!(clock.snapshot(Vec::new(), cached).fetched_at > cached);
+        }
+
+        /// The invariant as the other language actually sees it. `fetchedAt`
+        /// crosses the boundary as a JSON string, so stamps that differ by
+        /// less than the serialized precision would arrive identical however
+        /// distinct they are in Rust — and the nudge above is one
+        /// nanosecond, which is exactly the size that would be lost to a
+        /// millisecond-truncating encoder.
+        #[test]
+        fn distinct_stamps_survive_serialization_to_the_frontend() {
+            let frozen = Utc::now();
+            let mut clock = SnapshotClock::default();
+
+            let first = serde_json::to_value(clock.snapshot(Vec::new(), frozen)).unwrap();
+            let second = serde_json::to_value(clock.snapshot(Vec::new(), frozen)).unwrap();
+            assert_ne!(
+                first["fetchedAt"], second["fetchedAt"],
+                "the two stamps arrive at the frontend as the same string: {first}, {second}"
+            );
+        }
+
+        /// Everything else the two literals this replaced were carrying:
+        /// the quotas pass through untouched, and the snapshot is live.
+        /// `stale` is what `cache::load_snapshot` sets on the replayed one,
+        /// and nothing in the loop sets it back.
+        #[test]
+        fn the_quotas_pass_through_and_a_stamped_snapshot_is_never_stale() {
+            let quotas = vec![Quota {
+                id: "session".into(),
+                label: "Session".into(),
+                percent: 20.0,
+                severity: crate::model::Severity::Normal,
+                resets_at: None,
+                is_active: true,
+            }];
+            let snapshot = SnapshotClock::default().snapshot(quotas.clone(), Utc::now());
+
+            assert_eq!(snapshot.quotas, quotas);
+            assert!(!snapshot.stale);
         }
     }
 
