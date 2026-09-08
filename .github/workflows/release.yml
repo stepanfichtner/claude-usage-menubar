@@ -46,7 +46,7 @@ jobs:
   # never the .dmg, so this can never break an update. If the macOS job goes
   # red here, re-run just that job — it is not a regression.
   # Linux is built and tested on every push by ci.yml, but no one has run it
-  # on real hardware yet, so 0.1.0 ships macOS only. The leg comes back once
+  # on real hardware yet, so releases are macOS only. The leg comes back once
   # the Ubuntu verification passes — see the README's Ubuntu section.
   build:
     needs: guard

@@ -9,7 +9,7 @@ the Claude desktop app at once. That is the whole reason it exists: running seve
 projects plus the desktop app, there is otherwise nowhere to see the total.
 
 macOS today. The codebase already builds and passes its tests on Ubuntu in CI,
-but 0.1.0 ships macOS only — nobody has run it on real Linux hardware yet. See
+but releases are macOS only — nobody has run it on real Linux hardware yet. See
 the Ubuntu section below.
 
 <p align="center">
@@ -123,7 +123,7 @@ it rather than find out.
 
 Not published. The Linux build compiles and its full test suite passes in CI
 on every push (see `ci.yml`), but no one has run it on real Ubuntu hardware,
-so 0.1.0 does not include a `.deb` or an AppImage.
+so no release includes a `.deb` or an AppImage.
 
 The specific risk, not just an unticked checkbox: on macOS this app reads the
 OAuth token from the Keychain. On Linux it instead reads
@@ -268,7 +268,7 @@ git tag v0.2.0 && git push origin v0.2.0
 `.github/workflows/release.yml` refuses the tag unless it is on `main` and
 matches `Cargo.toml`, then builds macOS (universal `.dmg` + `.app`) and
 publishes a draft GitHub release with `latest.json` for the in-app updater
-attached. The Ubuntu leg is disabled for 0.1.0 — see the Ubuntu section under
+attached. The Ubuntu leg stays disabled — see the Ubuntu section under
 Install — and returns to this workflow once someone has verified the Linux
 build on real hardware.
 
