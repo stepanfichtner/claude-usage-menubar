@@ -137,17 +137,51 @@ fn current_quota_lines<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
 pub struct LastMenu(std::sync::Mutex<Option<(Vec<String>, String)>>);
 
 impl LastMenu {
-    /// Records what is about to be rendered and reports whether it differs
-    /// from what was rendered before. `true` the first time, so the menu
-    /// after launch is always built.
-    fn changed(&self, lines: &[String], check_updates_label: &str) -> bool {
+    /// Whether a menu built from these two would differ from the one the
+    /// tray is showing. `true` before anything has been recorded, so the
+    /// first menu after launch is always built.
+    ///
+    /// Asking is side-effect free, and deliberately: this used to record
+    /// what it had been asked about, which meant a `build_menu` or
+    /// `set_menu` that then failed — both results are discarded — left the
+    /// record claiming content the tray had never received. Every later
+    /// `apply` with that same content would skip against it, so the stale
+    /// menu stayed until the numbers moved. Recording is `record`'s job, and
+    /// `render_menu` calls it only once a menu has actually been installed.
+    fn differs_from_rendered(&self, lines: &[String], check_updates_label: &str) -> bool {
         let rendering = (lines.to_vec(), check_updates_label.to_string());
-        let mut last = self.0.lock().unwrap();
-        if last.as_ref() == Some(&rendering) {
-            return false;
+        self.0.lock().unwrap().as_ref() != Some(&rendering)
+    }
+
+    /// Records what the tray is now showing.
+    fn record(&self, lines: &[String], check_updates_label: &str) {
+        *self.0.lock().unwrap() = Some((lines.to_vec(), check_updates_label.to_string()));
+    }
+}
+
+/// Build the menu and hand it to `tray`, recording what the tray is showing
+/// only once it has actually taken it.
+///
+/// Either half can fail — `muda` refusing to construct the menu, the tray
+/// refusing it — and both failures are discarded, as they were before. What
+/// must not happen is `LastMenu` recording through one of them: `apply`
+/// would then skip every later rebuild of that same content and the menu the
+/// tray never received would never be retried. Leaving the record untouched
+/// restores what the unconditional rebuild gave for free, which is that a
+/// transient failure heals on the next poll.
+fn render_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    tray: &tauri::tray::TrayIcon<R>,
+    labels: &[String],
+    check_updates_label: &str,
+) {
+    let Ok(menu) = build_menu(app, labels, check_updates_label) else {
+        return;
+    };
+    if tray.set_menu(Some(menu)).is_ok() {
+        if let Some(last) = app.try_state::<std::sync::Arc<LastMenu>>() {
+            last.record(labels, check_updates_label);
         }
-        *last = Some(rendering);
-        true
     }
 }
 
@@ -265,13 +299,11 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, snapshot: &UsageSnapshot) {
     // Only rebuild when the result would differ. An unmanaged `LastMenu`
     // means "rebuild every time", which is what this did before.
     let check_updates = check_updates_label(app);
-    let changed = app
+    let rebuild_needed = app
         .try_state::<std::sync::Arc<LastMenu>>()
-        .is_none_or(|last| last.changed(&labels, &check_updates));
-    if changed {
-        if let Ok(menu) = build_menu(app, &labels, &check_updates) {
-            let _ = tray.set_menu(Some(menu));
-        }
+        .is_none_or(|last| last.differs_from_rendered(&labels, &check_updates));
+    if rebuild_needed {
+        render_menu(app, &tray, &labels, &check_updates);
     }
 }
 
@@ -279,24 +311,20 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, snapshot: &UsageSnapshot) {
 /// fresh `UsageSnapshot`. Used when the update-check status changes, so the
 /// outcome appears the moment it changes rather than waiting for the
 /// poller's next cycle to rebuild the menu incidentally. The update-check
-/// label itself is read fresh inside `build_menu`, same as any other
-/// rebuild.
+/// label is read here and passed down, freshly each time, so the rebuild
+/// carries whatever the status says at this moment.
+///
+/// Unconditional, unlike `apply`'s: this is only called because something
+/// already changed. It still goes through `render_menu`, so `LastMenu` ends
+/// up describing what the tray is showing rather than only what `apply` last
+/// pushed.
 pub fn refresh_menu(app: &AppHandle) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     let labels = current_quota_lines(app);
     let check_updates = check_updates_label(app);
-    // Unconditional: this is only called because something already changed.
-    // The record is still updated, so `apply`'s skip stays a true statement
-    // about what the tray is showing rather than about what `apply` last
-    // pushed.
-    if let Some(last) = app.try_state::<std::sync::Arc<LastMenu>>() {
-        last.changed(&labels, &check_updates);
-    }
-    if let Ok(menu) = build_menu(app, &labels, &check_updates) {
-        let _ = tray.set_menu(Some(menu));
-    }
+    render_menu(app, &tray, &labels, &check_updates);
 }
 
 /// Whether a tray click event should toggle the popover.
@@ -438,16 +466,19 @@ mod tests {
     #[test]
     fn an_unchanged_menu_is_not_rebuilt_after_the_first_one() {
         let last = LastMenu::default();
-        assert!(last.changed(&[], "Check for Updates…"));
-        assert!(!last.changed(&[], "Check for Updates…"));
-        assert!(!last.changed(&[], "Check for Updates…"));
+        assert!(last.differs_from_rendered(&[], "Check for Updates…"));
+        last.record(&[], "Check for Updates…");
+        assert!(!last.differs_from_rendered(&[], "Check for Updates…"));
+        assert!(!last.differs_from_rendered(&[], "Check for Updates…"));
     }
 
     #[test]
     fn a_changed_quota_line_rebuilds() {
         let last = LastMenu::default();
-        last.changed(&["Label session — 20% · in 3h 58m".to_string()], "Check…");
-        assert!(last.changed(&["Label session — 21% · in 3h 57m".to_string()], "Check…"));
+        last.record(&["Label session — 20% · in 3h 58m".to_string()], "Check…");
+        assert!(
+            last.differs_from_rendered(&["Label session — 21% · in 3h 57m".to_string()], "Check…")
+        );
     }
 
     /// The case that decides whether the label belongs in the comparison at
@@ -459,8 +490,35 @@ mod tests {
     fn a_changed_check_updates_label_rebuilds_even_with_identical_quota_lines() {
         let lines = ["Label session — 20% · in 3h 58m".to_string()];
         let last = LastMenu::default();
-        last.changed(&lines, "Up to date");
-        assert!(last.changed(&lines, "Check for Updates…"));
+        last.record(&lines, "Up to date");
+        assert!(last.differs_from_rendered(&lines, "Check for Updates…"));
+    }
+
+    /// Asking must not be what records. `build_menu` and `set_menu` can both
+    /// fail and both results are discarded, so if the question recorded its
+    /// own subject — which it used to — a menu the tray never received would
+    /// be remembered as rendered, and every later `apply` carrying that same
+    /// content would skip against it. The stale menu would then sit there
+    /// until the numbers moved, where the unconditional rebuild this
+    /// replaced would have retried within one poll.
+    ///
+    /// The successful render first is what makes the second half mean
+    /// something: it shows `record` really is what moves the answer, so the
+    /// repeated `true` below is the query keeping its hands off rather than
+    /// nothing being wired up at all.
+    #[test]
+    fn a_menu_that_was_never_installed_is_not_remembered_as_rendered() {
+        let last = LastMenu::default();
+        last.record(&[], "Check for Updates…");
+        assert!(!last.differs_from_rendered(&[], "Check for Updates…"));
+
+        // New content, and the render fails, so nothing records it.
+        let lines = ["Label session — 20% · in 3h 58m".to_string()];
+        assert!(last.differs_from_rendered(&lines, "Check for Updates…"));
+        assert!(
+            last.differs_from_rendered(&lines, "Check for Updates…"),
+            "the next poll must try again, not skip against a menu that was never installed"
+        );
     }
 
     /// Every snapshot `apply` renders lands in `LastSnapshot`, and each one

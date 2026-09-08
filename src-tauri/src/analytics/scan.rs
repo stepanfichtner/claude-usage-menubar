@@ -113,9 +113,19 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
     // tab is grouped by day, so a request that cannot be placed in time
     // cannot be shown truthfully; dropping it also matches what an
     // *unparseable* timestamp already did — serde fails the whole line — so
-    // the two ways of having no date now behave the same. The cost is real
-    // and is the lesser one: those tokens leave the totals rather than
-    // landing on a day they did not happen.
+    // the two ways of having no date now behave the same.
+    //
+    // Dropping is undercounting, which `transcripts_under` calls the one
+    // failure this module is built to avoid — so it was measured before it
+    // was chosen, on the same corpus the figures there come from: of 31,922
+    // assistant lines carrying usage across 220 transcripts, **zero** lack a
+    // `timestamp` and zero carry one that will not parse. Claude Code writes
+    // the field on every line. The trade is between two costs that are both
+    // real, and this is the side where the measured cost is nothing at all;
+    // if that ever stops being true, an `Option<DateTime<Utc>>` on `Entry`
+    // would keep the tokens in the totals while leaving them out of
+    // `by_day`, at the price of `by_day` no longer summing to
+    // `total_tokens`.
     let timestamp = raw.timestamp?;
     let message = raw.message?;
     let usage = message.usage?;
@@ -196,25 +206,6 @@ fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Walk every `*.jsonl` under `<root>/<project>/`, reading only what has been
-/// appended since the last call. `offsets` is the caller's persistent cursor
-/// map.
-///
-/// The walk goes all the way down, not one level. Claude Code keeps a
-/// session's subagent transcripts at
-/// `<project>/<session-uuid>/subagents/*.jsonl`, which on this machine is 164
-/// of 214 files. Stopping at the project directory's immediate children found
-/// 8,782 of 15,308 requests — 2.73B tokens against 3.56B, and $1,939 against
-/// $2,360, so 18% low in money and 23% in tokens — with nothing on screen to
-/// suggest it. The project name is still the top-level directory's, however
-/// deep the file sits: a subagent's spend belongs to the project whose session
-/// ran it.
-///
-/// Every failure is a skip, never an error: an unreadable root, an unreadable
-/// project directory, a file that vanished between listing and opening, a
-/// line that will not parse. A transcript directory is not this app's to
-/// validate, and there is no error string it could raise that would not risk
-/// quoting a path or a line back at the user.
 /// Every transcript to read, each paired with the project it counts towards,
 /// in a stable order.
 ///
@@ -226,6 +217,26 @@ fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
 /// out puts every total and every day quietly low, which is the one failure
 /// this module is built to avoid. They now count under the file's own stem,
 /// which is at least the session that produced them.
+///
+/// (`parse_line` accepts that same undercounting for an undated line, for a
+/// reason it gives there and against a measurement showing it costs nothing
+/// on a real corpus. The two are not in tension: a file with no project is
+/// still a file whose contents can be placed in time, and a line that cannot
+/// be placed in time has no truthful row to sit in.)
+///
+/// A *symlink* named `x.jsonl` at the root is not a loose transcript:
+/// `symlink_metadata` reports a link as a link rather than as the file it
+/// points at, so the branch below does not take it, and it falls through to
+/// the directory branch where `read_dir` fails and it is skipped. Plain
+/// `is_file` goes through `fs::metadata`, which follows, and would have made
+/// such a link readable here while the identical link one level down stayed
+/// skipped by `jsonl_files_under`'s no-follow policy.
+///
+/// The directory branch does still follow a link to a directory, because
+/// `read_dir` follows — unchanged from before this function existed, and the
+/// one place `jsonl_files_under`'s argument does not reach. It is bounded:
+/// one level of following at the root, after which that walk's own
+/// `file_type` checks take over and no arrangement of links can loop.
 fn transcripts_under(root: &Path) -> Vec<(String, PathBuf)> {
     let Ok(children) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -235,7 +246,9 @@ fn transcripts_under(root: &Path) -> Vec<(String, PathBuf)> {
 
     let mut transcripts = Vec::new();
     for path in paths {
-        let is_loose_transcript = path.is_file()
+        let is_loose_transcript = path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_file())
             && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
         if is_loose_transcript {
             let session = path
@@ -261,6 +274,25 @@ fn transcripts_under(root: &Path) -> Vec<(String, PathBuf)> {
     transcripts
 }
 
+/// Walk every transcript `transcripts_under` finds, reading only what has
+/// been appended since the last call. `offsets` is the caller's persistent
+/// cursor map.
+///
+/// The walk goes all the way down, not one level. Claude Code keeps a
+/// session's subagent transcripts at
+/// `<project>/<session-uuid>/subagents/*.jsonl`, which on this machine is 164
+/// of 214 files. Stopping at the project directory's immediate children found
+/// 8,782 of 15,308 requests — 2.73B tokens against 3.56B, and $1,939 against
+/// $2,360, so 18% low in money and 23% in tokens — with nothing on screen to
+/// suggest it. The project name is still the top-level directory's, however
+/// deep the file sits: a subagent's spend belongs to the project whose session
+/// ran it.
+///
+/// Every failure is a skip, never an error: an unreadable root, an unreadable
+/// project directory, a file that vanished between listing and opening, a
+/// line that will not parse. A transcript directory is not this app's to
+/// validate, and there is no error string it could raise that would not risk
+/// quoting a path or a line back at the user.
 pub fn scan_dir(root: &Path, offsets: &mut HashMap<PathBuf, u64>) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -465,6 +497,47 @@ mod tests {
         assert_eq!(
             entries[1].project, "loose-session",
             "with no project directory to name it, the file's own stem does"
+        );
+    }
+
+    /// The loose-transcript branch takes files, not links to files.
+    /// `jsonl_files_under` argues the no-follow policy for everything below
+    /// a project directory; reaching a root-level `.jsonl` through
+    /// `Path::is_file` — which goes through `fs::metadata` and follows —
+    /// would have made a link at the root readable while the identical link
+    /// one level deeper stayed skipped, which is a policy nobody chose.
+    ///
+    /// The real transcript beside it is what makes this a test of the link
+    /// and not of the branch: the scan has to still find one loose file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_transcript_at_the_root_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","timestamp":"2026-09-07T08:00:00.000Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":1,"output_tokens":0}}}}}}"#
+            ) + "\n"
+        };
+
+        let real = dir.path().join("real-session.jsonl");
+        std::fs::write(&real, line("real")).unwrap();
+
+        // The target lives outside the scanned root, so it is reachable only
+        // through the link — and it is a live, readable file, so this fails
+        // if the link is followed rather than passing because there was
+        // nothing at the other end.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.jsonl");
+        std::fs::write(&target, line("through-the-link")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("linked.jsonl")).unwrap();
+
+        let mut offsets = HashMap::new();
+        let entries = scan_dir(dir.path(), &mut offsets);
+        let ids: Vec<&str> = entries.iter().map(|e| e.request_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["real"],
+            "the link must be skipped and the plain file still read"
         );
     }
 
