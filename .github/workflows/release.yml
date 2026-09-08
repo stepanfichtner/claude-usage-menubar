@@ -5,13 +5,13 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   guard:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
       - name: Refuse tags that are not on main
@@ -50,6 +50,11 @@ jobs:
   # the Ubuntu verification passes — see the README's Ubuntu section.
   build:
     needs: guard
+    # The only job in either workflow that needs a write token: it creates the
+    # draft release and uploads the bundles. `guard` runs on the workflow-level
+    # read-only token.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -59,22 +64,22 @@ jobs:
             rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch head, 2026-09-03
         with:
           targets: ${{ matrix.rust-targets }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -109,7 +114,17 @@ jobs:
             echo "NOTES_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: tauri-apps/tauri-action@v0
+      # Every `uses:` above is pinned to a full commit SHA because of the three
+      # lines below. This step hands minisign's private key — the app's entire
+      # and permanent trust root — plus a `contents: write` token to
+      # third-party code. Against a mutable tag or branch ref, whoever controls
+      # that action can repoint it at new code at any time
+      # (tj-actions/changed-files, March 2025) and that code would run here,
+      # able to sign a malicious .app.tar.gz that every installed updater
+      # accepts as genuine. `releaseDraft: true` does not help: the token can
+      # publish. Do not tidy these SHAs back to tags. Bump them one at a time,
+      # deliberately, after reading the diff.
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
