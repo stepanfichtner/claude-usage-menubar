@@ -46,7 +46,7 @@
   const TITLE_SEPARATOR_OPTIONS: { value: TitleSeparator; label: string }[] = [
     { value: "space", label: "Space" },
     { value: "pipe", label: "Pipe" },
-    { value: "diamond", label: "Diamond" },
+    { value: "dash", label: "Dash" },
     { value: "slash", label: "Slash" },
   ];
 
@@ -284,6 +284,12 @@
           Choose what each usage limit shows next to the icon in your menu bar.
         </p>
 
+        <!-- The separator control lives inside this branch with the quota
+             list and the preview, deliberately: before the first snapshot
+             there is nothing to separate and nothing to preview it with, and
+             a lone control above "Waiting for usage data…" would be offering
+             a choice about limits the window cannot yet name. It appears
+             with them, and the preview beside it shows what it does. -->
         {#if settings.titleEntries.length === 0}
           <p class="waiting">Waiting for usage data…</p>
         {:else}

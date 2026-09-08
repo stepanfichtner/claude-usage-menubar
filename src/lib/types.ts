@@ -31,4 +31,4 @@ export interface Profile {
  * it on the way out of the store, so it cannot reach this window and there is
  * nothing here to represent it.
  */
-export type TitleSeparator = "space" | "pipe" | "diamond" | "slash";
+export type TitleSeparator = "space" | "pipe" | "dash" | "slash";

@@ -237,12 +237,7 @@ pub(crate) mod tests {
     /// above and quietly make the setting unusable.
     #[test]
     fn sanitized_leaves_a_chosen_separator_alone() {
-        for chosen in [
-            TitleSeparator::Space,
-            TitleSeparator::Pipe,
-            TitleSeparator::Diamond,
-            TitleSeparator::Slash,
-        ] {
+        for chosen in TitleSeparator::offered() {
             let settings = Settings {
                 title_separator: chosen,
                 ..Settings::default()
@@ -285,7 +280,6 @@ pub(crate) mod tests {
         let once = Settings {
             poll_interval_secs: 5,
             thresholds: vec![90, 50, 50, 0, 101, 80],
-            title_separator: TitleSeparator::Unknown,
             ..Settings::default()
         }
         .sanitized();
@@ -469,12 +463,7 @@ pub(crate) mod tests {
         let app = mock_app_with_store();
         let handle = app.handle();
 
-        for chosen in [
-            TitleSeparator::Pipe,
-            TitleSeparator::Diamond,
-            TitleSeparator::Slash,
-            TitleSeparator::Space,
-        ] {
+        for chosen in TitleSeparator::offered() {
             save(
                 handle,
                 &Settings {

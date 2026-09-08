@@ -8,11 +8,15 @@ import type { Quota, TitleSeparator } from "./types";
  * it is there: the mark and the room around it are one decision, and a menu
  * bar that spaced them differently from the real title would make this
  * preview a lie about the very thing it is previewing.
+ *
+ * A `Record` keyed by the union, so a fifth name added to `TitleSeparator`
+ * fails to type-check here until it is given a mark — this side's equivalent
+ * of the exhaustive `match` behind `TitleSeparator::offered()`.
  */
 const SEPARATOR_GLYPHS: Record<TitleSeparator, string> = {
   space: "  ",
   pipe: " | ",
-  diamond: " ◆ ",
+  dash: " – ",
   slash: " / ",
 };
 

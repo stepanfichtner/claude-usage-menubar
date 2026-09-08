@@ -30,7 +30,18 @@ const defaultEntries: TitleEntry[] = [
   { quotaId: "weekly_all", showPercent: true, showCountdown: true },
 ];
 
-const everySeparator: TitleSeparator[] = ["space", "pipe", "diamond", "slash"];
+// Every name, and a `Record` rather than an array literal on purpose: a fifth
+// member of `TitleSeparator` fails to type-check here until it is listed,
+// which is this side's mirror of `TitleSeparator::offered()` walking an
+// exhaustive `match`. An array would go on compiling while the new choice sat
+// untested — the flaw this replaced.
+const EVERY_SEPARATOR: Record<TitleSeparator, true> = {
+  space: true,
+  pipe: true,
+  dash: true,
+  slash: true,
+};
+const everySeparator = Object.keys(EVERY_SEPARATOR) as TitleSeparator[];
 
 describe("renderTitle", () => {
   // Mirrors `the_default_title_shows_session_and_weekly_all`.
@@ -89,7 +100,7 @@ describe("renderTitle", () => {
     const expected: Record<TitleSeparator, string> = {
       space: "24% · 4h1m  33%  3%",
       pipe: "24% · 4h1m | 33% | 3%",
-      diamond: "24% · 4h1m ◆ 33% ◆ 3%",
+      dash: "24% · 4h1m – 33% – 3%",
       slash: "24% · 4h1m / 33% / 3%",
     };
 

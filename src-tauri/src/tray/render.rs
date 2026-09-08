@@ -39,13 +39,27 @@ impl TitleEntry {
 /// What goes between one quota's segment and the next in the menu-bar title.
 ///
 /// The parts *within* a segment are already joined by `" · "` — percentage,
-/// then countdown — so the whole job of a group separator is to be something
-/// that middle dot cannot be mistaken for at menu-bar size. That is what
-/// rules out the obvious candidate: a bullet (`•`) is a middle dot at twice
-/// the diameter, and telling the two apart by size is exactly the judgement
-/// this setting exists to spare the reader. The three visible marks differ
-/// from `·` in shape rather than in size — a full-height stroke, a diamond,
-/// a diagonal.
+/// then countdown — so a group separator has two jobs, and every choice here
+/// was measured against both.
+///
+/// It cannot be mistakable for that middle dot (U+00B7). That rules out the
+/// obvious candidate: a bullet (`•`, U+2022) is the same round shape at
+/// twice the diameter, so finding the group boundary would still be a size
+/// judgement — the judgement this setting exists to spare the reader. The
+/// three visible marks differ from `·` in shape, not in size: a vertical
+/// stroke, a horizontal one, a diagonal.
+///
+/// And the system font has to contain it, so the menu bar never falls back
+/// to another face for one glyph in the middle of a title. `/System/Library/
+/// Fonts/SFNS.ttf`'s cmap was read directly for each candidate: `|`, `–` and
+/// `/` are in it; `◆` (U+25C6) is not, which is why the diamond that was
+/// first written here is a dash instead. Falling back is not merely
+/// cosmetic — U+25C6 is East-Asian-ambiguous, so a machine whose fallback
+/// lands on a CJK face would draw it double-width.
+///
+/// `|` rather than `│` (U+2502) for the same reason read the other way:
+/// both are in SF Pro, but a box-drawing character is drawn on a wide fixed
+/// cell, which at menu-bar size shows as a lighter stroke marooned in space.
 ///
 /// `Space` is the two literal spaces 0.1.0 rendered, and stays the default:
 /// nobody's menu bar changes until they ask it to.
@@ -54,7 +68,7 @@ pub enum TitleSeparator {
     #[default]
     Space,
     Pipe,
-    Diamond,
+    Dash,
     Slash,
     /// A name this build does not know: written by a newer build, or by
     /// hand. Deserializing lands here instead of failing, because failing
@@ -73,13 +87,42 @@ impl TitleSeparator {
         match self {
             TitleSeparator::Space => "  ",
             TitleSeparator::Pipe => " | ",
-            TitleSeparator::Diamond => " ◆ ",
+            TitleSeparator::Dash => " – ",
             TitleSeparator::Slash => " / ",
             // Deliberately the default's glyph rather than a second literal:
             // an unrecognised choice should leave the menu bar exactly as it
             // was, and that stays true if the default's spacing is ever
             // revised.
             TitleSeparator::Unknown => Self::default().glyph(),
+        }
+    }
+
+    /// Every choice the settings window offers, in the order it offers them.
+    ///
+    /// Walked through `next_choice`, whose `match` names every variant, so a
+    /// fifth one cannot be added without this list being told about it: the
+    /// crate stops compiling until the new variant has an arm, and that arm
+    /// is where it is decided whether the choice is offered or not. A
+    /// `[Space, Pipe, Dash, Slash]` literal — which is what this was — goes
+    /// on compiling happily while a new choice sits untested, and the tests
+    /// below iterate this, so "every separator" has to mean every separator.
+    ///
+    /// `Unknown` is not on the list. It is what a name this build does not
+    /// know deserializes to, never something to pick.
+    pub fn offered() -> impl Iterator<Item = TitleSeparator> {
+        std::iter::successors(Some(TitleSeparator::Space), |separator| {
+            separator.next_choice()
+        })
+    }
+
+    /// The choice after `self`, or `None` at the end of the list. Exists for
+    /// `offered`; see there for why it is a `match` rather than an array.
+    fn next_choice(self) -> Option<TitleSeparator> {
+        match self {
+            TitleSeparator::Space => Some(TitleSeparator::Pipe),
+            TitleSeparator::Pipe => Some(TitleSeparator::Dash),
+            TitleSeparator::Dash => Some(TitleSeparator::Slash),
+            TitleSeparator::Slash | TitleSeparator::Unknown => None,
         }
     }
 
@@ -93,7 +136,7 @@ impl TitleSeparator {
         match self {
             TitleSeparator::Space => "space",
             TitleSeparator::Pipe => "pipe",
-            TitleSeparator::Diamond => "diamond",
+            TitleSeparator::Dash => "dash",
             TitleSeparator::Slash => "slash",
             TitleSeparator::Unknown => "unknown",
         }
@@ -103,7 +146,7 @@ impl TitleSeparator {
         match name {
             "space" => TitleSeparator::Space,
             "pipe" => TitleSeparator::Pipe,
-            "diamond" => TitleSeparator::Diamond,
+            "dash" => TitleSeparator::Dash,
             "slash" => TitleSeparator::Slash,
             _ => TitleSeparator::Unknown,
         }
@@ -544,12 +587,17 @@ mod tests {
             },
         ];
 
-        for (separator, expected) in [
-            (TitleSeparator::Space, "24% · 4h1m  33%  3%"),
-            (TitleSeparator::Pipe, "24% · 4h1m | 33% | 3%"),
-            (TitleSeparator::Diamond, "24% · 4h1m ◆ 33% ◆ 3%"),
-            (TitleSeparator::Slash, "24% · 4h1m / 33% / 3%"),
-        ] {
+        for separator in TitleSeparator::offered() {
+            // A `match` rather than a table of pairs, for the same reason
+            // `offered` walks one: a fifth choice cannot reach this loop
+            // without being given the string it is expected to render.
+            let expected = match separator {
+                TitleSeparator::Space => "24% · 4h1m  33%  3%",
+                TitleSeparator::Pipe => "24% · 4h1m | 33% | 3%",
+                TitleSeparator::Dash => "24% · 4h1m – 33% – 3%",
+                TitleSeparator::Slash => "24% · 4h1m / 33% / 3%",
+                TitleSeparator::Unknown => unreachable!("offered() yields choices only"),
+            };
             assert_eq!(
                 render_title(&quotas, &entries, separator, now()),
                 expected,
@@ -578,12 +626,7 @@ mod tests {
             show_countdown: true,
         }];
 
-        for separator in [
-            TitleSeparator::Space,
-            TitleSeparator::Pipe,
-            TitleSeparator::Diamond,
-            TitleSeparator::Slash,
-        ] {
+        for separator in TitleSeparator::offered() {
             assert_eq!(
                 render_title(&quotas, &one, separator, now()),
                 "20% · 3h58m",
@@ -647,20 +690,18 @@ mod tests {
         );
     }
 
-    /// The rule every offered glyph is chosen under, kept as an assertion so
-    /// that adding a fifth choice has to clear it too: a group separator that
-    /// is a middle dot — or any dot — puts the same mark between groups as
+    /// The rule every offered glyph is chosen under, kept as an assertion
+    /// that a fifth choice has to clear too — which is what `offered()` is
+    /// for: it walks an exhaustive `match`, so a new variant cannot slip past
+    /// this loop the way it could past a hand-written list of three. A group
+    /// separator that is a dot puts the same mark between groups as
     /// `render_title` already puts inside one, which is worse than the two
     /// spaces it replaces. It also has to be visible at all; the invisible
     /// one is `Space`, and that is the default rather than a choice made to
     /// mark a boundary.
     #[test]
     fn no_offered_separator_can_be_mistaken_for_the_dot_inside_a_segment() {
-        for separator in [
-            TitleSeparator::Pipe,
-            TitleSeparator::Diamond,
-            TitleSeparator::Slash,
-        ] {
+        for separator in TitleSeparator::offered().filter(|s| *s != TitleSeparator::Space) {
             let glyph = separator.glyph();
             assert!(
                 !glyph.contains('·'),
@@ -687,13 +728,7 @@ mod tests {
     /// on every restart.
     #[test]
     fn separator_names_round_trip_through_their_stored_form() {
-        for separator in [
-            TitleSeparator::Space,
-            TitleSeparator::Pipe,
-            TitleSeparator::Diamond,
-            TitleSeparator::Slash,
-            TitleSeparator::Unknown,
-        ] {
+        for separator in TitleSeparator::offered().chain([TitleSeparator::Unknown]) {
             let json = serde_json::to_string(&separator).unwrap();
             let parsed: TitleSeparator = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, separator, "{separator:?} came back as {parsed:?}");
