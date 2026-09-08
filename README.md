@@ -13,11 +13,16 @@ but releases are macOS only — nobody has run it on real Linux hardware yet. Se
 the Ubuntu section below.
 
 <p align="center">
+  <img src=".github/images/menubar.png" alt="The menu bar item at four severities, with each separator option" width="456">
+</p>
+
+<p align="center">
   <img src=".github/images/panel-limits.png" alt="The Limits tab: two weekly rings and the current session" width="320">
   <img src=".github/images/panel-usage.png" alt="The Usage tab: local token and cost estimate by model, project and day" width="320">
 </p>
 
-<p align="center"><sub>Example data. The Usage tab is optional and off by default.</sub></p>
+<p align="center"><sub>Example data. Top: the crab at each severity, and the four separator
+choices. Bottom: the panel's two tabs — the Usage tab is optional and off by default.</sub></p>
 
 ## What it shows
 
