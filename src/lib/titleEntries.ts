@@ -55,9 +55,24 @@ export interface SnapshotStanding {
   stale: boolean;
   signedOut: boolean;
   /**
-   * `UsageSnapshot::fetched_at`, stamped `Utc::now()` once per emit by the
-   * poller, so it identifies the snapshot. `retireAbsentEntries` ignores it;
-   * `reconcileTitleEntries` uses it to count each snapshot exactly once.
+   * `UsageSnapshot::fetched_at`, which identifies the snapshot.
+   * `retireAbsentEntries` ignores it; `reconcileTitleEntries` uses it to
+   * count each snapshot exactly once.
+   *
+   * The Rust side guarantees this rather than leaving it to the clock:
+   * `poller::SnapshotClock` stamps every emit with a reading distinct from
+   * the one immediately before it, nudging by a nanosecond in the one case
+   * where two readings would be identical. Adjacent distinctness is exactly
+   * what the comparison below needs — `countedAt` is overwritten on every
+   * emit that differs, so the only stamp a new one can be confused with is
+   * its predecessor — and it is all that is promised: a clock stepped
+   * backwards produces a distinct but *earlier* stamp on purpose, so the
+   * footer's age stays honest.
+   *
+   * Compared as a string, never as a `Date`. That is not incidental: the
+   * nudge is one nanosecond, and `getTime()` is milliseconds, so parsing
+   * these before comparing them would erase the guarantee entirely and
+   * silently.
    */
   fetchedAt: string;
 }

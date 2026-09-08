@@ -217,7 +217,7 @@ fn profile_retry_after(
 }
 
 /// Stamps every snapshot this poller emits with a `fetched_at` distinct
-/// from the one before it.
+/// from the one immediately before it.
 ///
 /// R58, and a cross-language invariant: the settings window counts each
 /// snapshot exactly once when deciding whether a title entry's quota has
@@ -225,11 +225,22 @@ fn profile_retry_after(
 /// `fetchedAt` alone (`titleEntries.ts`'s `reconcileTitleEntries`). Two
 /// emits sharing a stamp are therefore counted as one — the absence tally
 /// stops advancing and a genuinely retired quota's row never goes away.
-///
 /// `Utc::now()` on its own left that resting on the platform clock's
-/// resolution rather than on anything in this codebase, and it is not true
-/// at all across a clock stepped backwards by an NTP correction. This makes
-/// it true by construction instead.
+/// resolution rather than on anything in this codebase; this makes it true
+/// by construction instead.
+///
+/// *Immediately* before is the whole contract, deliberately, and this does
+/// **not** promise a globally increasing sequence. `reconcileTitleEntries`
+/// compares one field — `standing.fetchedAt === state.countedAt` — and
+/// `countedAt` is overwritten on every emit that differs, so the only stamp
+/// a new one can be confused with is its predecessor. Buying monotonicity on
+/// top would cost something real: after a clock stepped backwards by an
+/// hour, holding the sequence increasing means emitting a `fetched_at` up to
+/// an hour ahead of the wall clock for an hour, and `freshness.ts`'s
+/// `secondsSince` clamps a future stamp to zero — so the footer would read
+/// "updated just now" and `ageIsStale` would never fire while the numbers
+/// really were going stale. Every stamp here is a genuine clock reading
+/// except where one would exactly repeat its predecessor.
 #[derive(Debug, Default)]
 struct SnapshotClock {
     last: Option<DateTime<Utc>>,
@@ -246,10 +257,10 @@ impl SnapshotClock {
     }
 
     /// One live snapshot, stamped `now` — or one nanosecond past the
-    /// previous stamp when `now` has not moved past it.
+    /// previous stamp in the one case where `now` would repeat it exactly.
     fn snapshot(&mut self, quotas: Vec<Quota>, now: DateTime<Utc>) -> UsageSnapshot {
         let fetched_at = match self.last {
-            Some(last) if now <= last => last + ChronoDuration::nanoseconds(1),
+            Some(last) if now == last => last + ChronoDuration::nanoseconds(1),
             _ => now,
         };
         self.last = Some(fetched_at);
@@ -871,14 +882,19 @@ mod tests {
 
             let first = clock.snapshot(Vec::new(), frozen).fetched_at;
             let second = clock.snapshot(Vec::new(), frozen).fetched_at;
-            assert!(second > first, "{first} then {second}");
+            assert_ne!(first, second);
         }
 
-        /// The run, not just the pair: five emits inside one tick have to be
-        /// five distinct stamps, or a quota needs more than
+        /// The run, not just the pair: five emits inside one tick must never
+        /// repeat the stamp before them, or a quota needs more than
         /// `RETIREMENT_MISSES` absences to retire.
+        ///
+        /// Adjacent distinctness, not a strictly increasing sequence — that
+        /// is the contract, and it is the whole of what
+        /// `reconcileTitleEntries` compares. See `SnapshotClock`'s own
+        /// comment for why the stronger promise is deliberately not made.
         #[test]
-        fn a_run_of_snapshots_from_one_reading_is_strictly_increasing() {
+        fn a_run_of_snapshots_from_one_reading_never_repeats_its_predecessor() {
             let frozen = Utc::now();
             let mut clock = SnapshotClock::default();
 
@@ -886,29 +902,41 @@ mod tests {
                 .map(|_| clock.snapshot(Vec::new(), frozen).fetched_at)
                 .collect();
             assert!(
-                stamps.windows(2).all(|pair| pair[0] < pair[1]),
+                stamps.windows(2).all(|pair| pair[0] != pair[1]),
                 "{stamps:?}"
             );
         }
 
-        /// An NTP correction stepping the clock backwards must not hand out
-        /// a stamp the frontend has already counted — the one case where
-        /// `Utc::now()` is not merely unproven but actually wrong.
+        /// An NTP correction stepping the clock backwards must still hand
+        /// out a stamp distinct from the one before it — and must hand out
+        /// the *real* reading while doing so.
+        ///
+        /// Forcing the stamp forward instead would leave `fetched_at` an
+        /// hour ahead of the wall clock for an hour, and `secondsSince`
+        /// clamps a future stamp to zero: the footer would say "updated just
+        /// now" and never turn amber, for the whole hour, however stale the
+        /// numbers actually got. Distinctness is what the frontend needs;
+        /// this is the price it does not have to pay for it.
         #[test]
-        fn a_clock_that_steps_backwards_still_yields_a_later_stamp() {
+        fn a_clock_that_steps_backwards_is_stamped_with_the_real_reading() {
             let now = Utc::now();
+            let stepped_back = now - ChronoDuration::hours(1);
             let mut clock = SnapshotClock::default();
 
             let first = clock.snapshot(Vec::new(), now).fetched_at;
-            let second = clock
-                .snapshot(Vec::new(), now - ChronoDuration::hours(1))
-                .fetched_at;
-            assert!(second > first, "{first} then {second}");
+            let second = clock.snapshot(Vec::new(), stepped_back).fetched_at;
+
+            assert_ne!(first, second);
+            assert_eq!(
+                second, stepped_back,
+                "a stepped-back clock is reported, not overridden, or the age goes wrong"
+            );
         }
 
-        /// A clock that does move is reported verbatim: the nudge above is
-        /// for a stalled clock only and must not accumulate into drift, or
-        /// the age the panel shows would creep away from the truth.
+        /// Every stamp is a genuine clock reading except the one case where
+        /// it would exactly repeat its predecessor. So an advancing clock is
+        /// reported verbatim, and the nanosecond nudge cannot accumulate
+        /// into drift that pulls the panel's age away from the truth.
         #[test]
         fn an_advancing_clock_is_stamped_verbatim() {
             let now = Utc::now();
@@ -917,6 +945,15 @@ mod tests {
 
             assert_eq!(clock.snapshot(Vec::new(), now).fetched_at, now);
             assert_eq!(clock.snapshot(Vec::new(), later).fetched_at, later);
+
+            // And the nudge itself does not push the *next* reading off: one
+            // repeat, then a clock that has moved on, lands on the truth.
+            assert_ne!(clock.snapshot(Vec::new(), later).fetched_at, later);
+            let later_still = later + ChronoDuration::seconds(60);
+            assert_eq!(
+                clock.snapshot(Vec::new(), later_still).fetched_at,
+                later_still
+            );
         }
 
         /// The cached snapshot replayed at launch is an emit like any other
@@ -929,7 +966,7 @@ mod tests {
             let cached = Utc::now();
             let mut clock = SnapshotClock::after(Some(cached));
 
-            assert!(clock.snapshot(Vec::new(), cached).fetched_at > cached);
+            assert_ne!(clock.snapshot(Vec::new(), cached).fetched_at, cached);
         }
 
         /// The invariant as the other language actually sees it. `fetchedAt`

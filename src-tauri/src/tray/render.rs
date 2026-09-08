@@ -143,7 +143,7 @@ impl IconKind {
 /// asserted in a plain unit test: `muda` (the native menu backend) refuses
 /// to construct a `Menu` off the main thread, and every `#[test]` runs on a
 /// worker thread, so a test can never build the real thing on macOS.
-pub(crate) enum MenuRow {
+pub(super) enum MenuRow {
     Item {
         id: &'static str,
         label: String,
@@ -161,7 +161,7 @@ pub(crate) enum MenuRow {
 /// rebuild (see that module), not baked in once: `tray::apply` rebuilds
 /// whenever the menu's content moves, so a stale literal would be pushed
 /// over whatever a check had just reported.
-pub(crate) fn trailing_rows(check_updates_label: String) -> Vec<MenuRow> {
+pub(super) fn trailing_rows(check_updates_label: String) -> Vec<MenuRow> {
     use MenuRow::{Item, Separator};
     vec![
         Item {
@@ -506,9 +506,10 @@ mod tests {
     }
 
     /// The label parameter really does reach the rendered row, not just the
-    /// idle default — the case that matters since `build_menu` passes
-    /// `updater::UpdateCheckStatus::label()`'s live output here on every
-    /// rebuild.
+    /// idle default — the case that matters since what arrives here is
+    /// `updater::UpdateCheckStatus::label()`'s live output, read by
+    /// `tray::apply` and `tray::refresh_menu` and threaded down through
+    /// `build_menu` at each rebuild.
     #[test]
     fn the_check_updates_row_carries_whatever_label_it_is_given() {
         let items: Vec<(&str, String, bool)> = trailing_rows("Checking for updates…".to_string())
