@@ -124,6 +124,26 @@ export function unpricedModels(byModel: Bucket[]): Bucket[] {
 }
 
 /**
+ * How many project rows the tab shows before it stops.
+ *
+ * The list is cost-ranked, so the top few are the ones worth reading and a
+ * machine with forty checkouts should not scroll through all of them.
+ */
+export const PROJECT_ROWS = 8;
+
+/**
+ * How many projects the list leaves out, or zero when it shows them all.
+ *
+ * The "Recent days" list is truncated too, but its heading does not claim to
+ * be complete — "Recent days" says as much. "By project" does claim it, so a
+ * ninth project that silently never appears makes the section a quiet lie:
+ * the totals above it include spend the list below it does not account for.
+ */
+export function hiddenProjects(byProject: Bucket[]): number {
+  return Math.max(0, byProject.length - PROJECT_ROWS);
+}
+
+/**
  * The span the estimate actually covers, or `null` when there is nothing to
  * describe.
  *

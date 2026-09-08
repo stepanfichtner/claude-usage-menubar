@@ -3,7 +3,9 @@ import {
   coveredRange,
   formatCost,
   formatTokens,
+  hiddenProjects,
   modelLabel,
+  PROJECT_ROWS,
   shortProject,
   unpricedModels,
   type Bucket,
@@ -185,5 +187,24 @@ describe("unpricedModels", () => {
 
   it("is empty when every model was priced", () => {
     expect(unpricedModels([bucket("claude-opus-5", 5_000_000)])).toEqual([]);
+  });
+});
+
+describe("hiddenProjects", () => {
+  const projects = (count: number) =>
+    Array.from({ length: count }, (_, i) => bucket(`project-${i}`, 1_000));
+
+  it("counts nothing hidden while the list fits", () => {
+    expect(hiddenProjects(projects(PROJECT_ROWS))).toBe(0);
+    expect(hiddenProjects(projects(1))).toBe(0);
+    expect(hiddenProjects([])).toBe(0);
+  });
+
+  // The section heading says "By project" with no qualifier, so a ninth
+  // project that simply never appears makes it a quiet lie: the totals above
+  // include spend the list below does not account for.
+  it("counts the projects the list stops short of", () => {
+    expect(hiddenProjects(projects(PROJECT_ROWS + 1))).toBe(1);
+    expect(hiddenProjects(projects(40))).toBe(40 - PROJECT_ROWS);
   });
 });

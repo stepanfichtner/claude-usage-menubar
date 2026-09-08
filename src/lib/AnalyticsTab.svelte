@@ -5,7 +5,9 @@
     coveredRange,
     formatCost,
     formatTokens,
+    hiddenProjects,
     modelLabel,
+    PROJECT_ROWS,
     shortProject,
     unpricedModels,
     type Summary,
@@ -34,6 +36,10 @@
   // A total with no period stated invites being read as a lifetime one. What
   // this actually covers is whatever transcript history is still on disk.
   const covered = $derived(summary ? coveredRange(summary.byDay) : null);
+
+  // The project list stops at `PROJECT_ROWS`; this is what the section says
+  // about the rows it did not print, so the heading does not read as complete.
+  const hidden = $derived(summary ? hiddenProjects(summary.byProject) : 0);
 </script>
 
 {#if error}
@@ -86,13 +92,18 @@
   {/each}
 
   <h4>By project</h4>
-  {#each summary.byProject.slice(0, 8) as bucket (bucket.name)}
+  {#each summary.byProject.slice(0, PROJECT_ROWS) as bucket (bucket.name)}
     <div class="row">
       <span title={bucket.name}>{shortProject(bucket.name)}</span>
       <span class="tokens">{formatTokens(bucket.tokens)}</span>
       <span class="cost">{formatCost(bucket.cost, bucket.unpricedTokens)}</span>
     </div>
   {/each}
+  {#if hidden > 0}
+    <div class="row more">
+      <span>…and {hidden} more {hidden === 1 ? "project" : "projects"}</span>
+    </div>
+  {/if}
 
   <!-- Not "Last 14 days": these are the newest 14 days that *had* usage, and
        any idle day between them means they span more than fourteen. -->
@@ -166,6 +177,10 @@
     flex: none;
     min-width: 58px;
     text-align: right;
+  }
+  .row.more {
+    color: var(--fg-muted);
+    font-style: italic;
   }
   .row.unpriced .cost {
     color: var(--high);

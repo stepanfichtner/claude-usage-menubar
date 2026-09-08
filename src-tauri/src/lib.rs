@@ -69,6 +69,18 @@ fn get_settings(app: tauri::AppHandle) -> settings::Settings {
 /// it got. Held across calls so the second and later scans read only what has
 /// been appended, rather than re-parsing hundreds of megabytes of transcript
 /// every time the panel opens.
+///
+/// It grows for the life of the process and is never trimmed, which is a
+/// deliberate acceptance rather than an oversight. The bound is one `Entry`
+/// plus one `HashSet` string per request ever seen — around 300 bytes, so
+/// roughly 9 MB for the 31,000 requests on the machine this was measured on,
+/// and it only grows as new requests are made while the app stays running.
+/// Trimming it is not cheap: dropping old entries would lower the very
+/// lifetime totals the tab exists to show, and folding entries into running
+/// aggregates instead would still leave the `seen` set — the larger half —
+/// growing, in exchange for reworking the one code path where a mistake
+/// silently changes a dollar figure. Worth revisiting only with a measured
+/// reason to.
 #[derive(Default)]
 pub struct AnalyticsState {
     inner: std::sync::Mutex<AnalyticsInner>,
@@ -138,10 +150,20 @@ async fn summary_for<R: tauri::Runtime>(
     tauri::async_runtime::spawn_blocking(move || {
         use tauri::Manager;
         let state = app.state::<AnalyticsState>();
+        // A panic anywhere inside the scan poisons this mutex, and treating
+        // that as an error made the poisoning permanent: every later call
+        // answered "analytics state unavailable" for the rest of the
+        // process, so one bad line killed the tab until the app was
+        // restarted. Recovering instead is sound here because of what is
+        // behind the lock — a `HashMap` of file cursors, a `HashSet` of
+        // request ids and a `Vec` of entries, each of which a panic between
+        // operations leaves structurally intact. The worst a recovered
+        // guard can carry is a half-folded scan, and the very next call
+        // re-reads from the cursors that did get written.
         let mut guard = state
             .inner
             .lock()
-            .map_err(|_| "analytics state unavailable".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let fresh = analytics::scan::scan_dir(&root, &mut guard.offsets);
         guard.accumulate(fresh);
         Ok(analytics::summarize(&guard.entries))
@@ -565,6 +587,50 @@ mod tests {
         let summary = tauri::async_runtime::block_on(summary_for(app.handle())).unwrap();
         assert_eq!(summary, analytics::Summary::default());
         assert_eq!(summary.total_tokens, 0, "the transcript must not be read");
+    }
+
+    /// A panic while the analytics lock is held poisons it, and a poisoned
+    /// `Mutex` stays poisoned for the life of the process. Treating that as
+    /// an error meant one panic anywhere inside the scan left every later
+    /// call answering "analytics state unavailable" until the app was
+    /// restarted — the tab dead, with a message that gives no hint that
+    /// restarting is the cure.
+    ///
+    /// The panic is raised here rather than provoked from inside the scan
+    /// because `scan_dir` deliberately has no panicking path; what is under
+    /// test is the recovery, not any particular way of getting there. The
+    /// assertion between the two halves is what makes this mean something:
+    /// it confirms the lock really is poisoned before asking `summary_for`
+    /// to work through it.
+    #[test]
+    fn a_poisoned_analytics_lock_recovers_instead_of_failing_for_the_process_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        plant_transcript(dir.path());
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(AnalyticsState::default());
+
+        settings::save(
+            app.handle(),
+            &settings::Settings {
+                analytics_enabled: true,
+                ..settings::Settings::default()
+            },
+        )
+        .unwrap();
+
+        let state = app.handle().state::<AnalyticsState>();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = state.inner.lock().unwrap();
+            panic!("as a panic inside the scan would");
+        }));
+        assert!(panicked.is_err(), "the closure above must have panicked");
+        assert!(
+            state.inner.lock().is_err(),
+            "this test says nothing unless the lock really is poisoned"
+        );
+
+        let summary = tauri::async_runtime::block_on(summary_for(app.handle())).unwrap();
+        assert_eq!(summary.total_tokens, 1_000_000);
     }
 
     /// The other side of the same switch, which is what stops the test above

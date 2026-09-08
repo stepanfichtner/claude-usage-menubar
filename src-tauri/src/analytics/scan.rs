@@ -61,15 +61,30 @@ struct RawMessage {
     usage: Option<RawUsage>,
 }
 
+/// Zero for a count written as an explicit `null`.
+///
+/// `#[serde(default)]` covers a field that is *absent*; one present as
+/// `null` is a type error, and a type error anywhere in the line fails the
+/// whole `RawLine` — so a single `"output_tokens": null` took the other four
+/// counts down with it and the request vanished from the estimate entirely.
+/// Absent and `null` say the same thing about a token class, so they get the
+/// same answer.
+fn null_as_zero<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
 #[derive(Deserialize, Default)]
 struct RawUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_read_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_creation: Option<RawCacheCreation>,
@@ -77,9 +92,9 @@ struct RawUsage {
 
 #[derive(Deserialize)]
 struct RawCacheCreation {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     ephemeral_5m_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     ephemeral_1h_input_tokens: u64,
 }
 
@@ -91,6 +106,17 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
     if raw.r#type != "assistant" {
         return None;
     }
+    // A line with no usable timestamp is dropped rather than dated. This
+    // used to fall back to `Utc::now()`, which silently added the request to
+    // *today's* row however old it was, and made the same transcript
+    // summarize differently either side of midnight. Every figure in this
+    // tab is grouped by day, so a request that cannot be placed in time
+    // cannot be shown truthfully; dropping it also matches what an
+    // *unparseable* timestamp already did — serde fails the whole line — so
+    // the two ways of having no date now behave the same. The cost is real
+    // and is the lesser one: those tokens leave the totals rather than
+    // landing on a day they did not happen.
+    let timestamp = raw.timestamp?;
     let message = raw.message?;
     let usage = message.usage?;
 
@@ -121,7 +147,7 @@ pub fn parse_line(line: &str, project: &str) -> Option<Entry> {
     Some(Entry {
         request_id: raw.request_id.unwrap_or_default(),
         model: message.model.unwrap_or_default(),
-        timestamp: raw.timestamp.unwrap_or_else(Utc::now),
+        timestamp,
         project: project.to_string(),
         input: usage.input_tokens,
         output: usage.output_tokens,
@@ -189,75 +215,108 @@ fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
 /// line that will not parse. A transcript directory is not this app's to
 /// validate, and there is no error string it could raise that would not risk
 /// quoting a path or a line back at the user.
-pub fn scan_dir(root: &Path, offsets: &mut HashMap<PathBuf, u64>) -> Vec<Entry> {
-    let mut entries = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    let Ok(projects) = std::fs::read_dir(root) else {
-        return entries;
+/// Every transcript to read, each paired with the project it counts towards,
+/// in a stable order.
+///
+/// A child directory of `root` is a project, and every `.jsonl` anywhere
+/// beneath it belongs to it however deep it sits. A `.jsonl` sitting
+/// *directly* in `root` has no project directory to take a name from and was
+/// skipped entirely — `read_dir` on a file fails, so the whole file was
+/// passed over silently. Those tokens were really spent, and leaving them
+/// out puts every total and every day quietly low, which is the one failure
+/// this module is built to avoid. They now count under the file's own stem,
+/// which is at least the session that produced them.
+fn transcripts_under(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(children) = std::fs::read_dir(root) else {
+        return Vec::new();
     };
-    let mut project_dirs: Vec<PathBuf> = projects.flatten().map(|dir| dir.path()).collect();
-    project_dirs.sort();
+    let mut paths: Vec<PathBuf> = children.flatten().map(|child| child.path()).collect();
+    paths.sort();
 
-    for project_dir in project_dirs {
-        let project = project_dir
+    let mut transcripts = Vec::new();
+    for path in paths {
+        let is_loose_transcript = path.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl");
+        if is_loose_transcript {
+            let session = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            transcripts.push((session, path));
+            continue;
+        }
+        // Anything else is treated as a project directory, exactly as
+        // before: `jsonl_files_under` answers with an empty list for a path
+        // it cannot read, so a stray non-directory costs nothing.
+        let project = path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        for path in jsonl_files_under(&project_dir) {
-            let Ok(mut handle) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let size = handle.metadata().map(|m| m.len()).unwrap_or(0);
-            let cursor = offsets.get(&path).copied().unwrap_or(0);
-            // A cursor past the end means the file was rotated or truncated.
-            let start = if cursor > size { 0 } else { cursor };
-            if handle.seek(SeekFrom::Start(start)).is_err() {
-                continue;
-            }
-
-            // Read with `read_line`, which keeps the terminator, rather than
-            // `lines()`, which discards it. The cursor may only advance past
-            // bytes that are certainly there: `line.len() + 1` assumes every
-            // line ended in a newline, and a transcript caught mid-write — the
-            // last line present, its newline not yet flushed — then leaves the
-            // cursor one byte past the end of the file. That costs a full
-            // re-read of the whole transcript on every later scan, and if the
-            // file grows without supplying the missing newline it starts the
-            // next read one byte late and loses the request that follows.
-            let mut reader = BufReader::new(&mut handle);
-            let mut consumed = start;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let Ok(bytes) = reader.read_line(&mut line) else {
-                    break;
-                };
-                if bytes == 0 {
-                    break;
-                }
-                // The unterminated tail is still parsed. A line that parses is
-                // a complete JSON object with only its terminator missing; a
-                // genuinely half-written one is invalid JSON and is discarded
-                // like any other. It is simply not counted as consumed, so the
-                // next scan reads it again — and the dedup below, plus the
-                // caller's own across-call guard, keep that from double
-                // counting it.
-                if line.ends_with('\n') {
-                    consumed += bytes as u64;
-                }
-                if let Some(entry) = parse_line(line.trim_end(), &project) {
-                    // One request can span several lines; count it once. An
-                    // empty id is not an identity, so it can never merge two
-                    // genuinely different requests into one.
-                    if entry.request_id.is_empty() || seen.insert(entry.request_id.clone()) {
-                        entries.push(entry);
-                    }
-                }
-            }
-            offsets.insert(path, consumed);
+        for file in jsonl_files_under(&path) {
+            transcripts.push((project.clone(), file));
         }
+    }
+    transcripts
+}
+
+pub fn scan_dir(root: &Path, offsets: &mut HashMap<PathBuf, u64>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for (project, path) in transcripts_under(root) {
+        let Ok(mut handle) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let size = handle.metadata().map(|m| m.len()).unwrap_or(0);
+        let cursor = offsets.get(&path).copied().unwrap_or(0);
+        // A cursor past the end means the file was rotated or truncated.
+        let start = if cursor > size { 0 } else { cursor };
+        if handle.seek(SeekFrom::Start(start)).is_err() {
+            continue;
+        }
+
+        // Read with `read_line`, which keeps the terminator, rather than
+        // `lines()`, which discards it. The cursor may only advance past
+        // bytes that are certainly there: `line.len() + 1` assumes every
+        // line ended in a newline, and a transcript caught mid-write — the
+        // last line present, its newline not yet flushed — then leaves the
+        // cursor one byte past the end of the file. That costs a full
+        // re-read of the whole transcript on every later scan, and if the
+        // file grows without supplying the missing newline it starts the
+        // next read one byte late and loses the request that follows.
+        let mut reader = BufReader::new(&mut handle);
+        let mut consumed = start;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let Ok(bytes) = reader.read_line(&mut line) else {
+                break;
+            };
+            if bytes == 0 {
+                break;
+            }
+            // The unterminated tail is still parsed. A line that parses is
+            // a complete JSON object with only its terminator missing; a
+            // genuinely half-written one is invalid JSON and is discarded
+            // like any other. It is simply not counted as consumed, so the
+            // next scan reads it again — and the dedup below, plus the
+            // caller's own across-call guard, keep that from double
+            // counting it.
+            if line.ends_with('\n') {
+                consumed += bytes as u64;
+            }
+            if let Some(entry) = parse_line(line.trim_end(), &project) {
+                // One request can span several lines; count it once. An
+                // empty id is not an identity, so it can never merge two
+                // genuinely different requests into one.
+                if entry.request_id.is_empty() || seen.insert(entry.request_id.clone()) {
+                    entries.push(entry);
+                }
+            }
+        }
+        offsets.insert(path, consumed);
     }
     entries
 }
@@ -310,6 +369,103 @@ mod tests {
         assert!(parse_line(r#"{"type":"user","message":{"role":"user"}}"#, "alpha").is_none());
         assert!(parse_line("not json", "alpha").is_none());
         assert!(parse_line("", "alpha").is_none());
+    }
+
+    /// A count written as an explicit `null` used to fail the whole line —
+    /// serde's `default` fills in an *absent* field, not a null one, and a
+    /// type error anywhere in the object fails the object. So one
+    /// `"output_tokens": null` took the other four counts with it and the
+    /// request left the estimate entirely. The other counts here are
+    /// non-zero so that a line silently dropped is visibly different from
+    /// one parsed with a zero in the null's place.
+    #[test]
+    fn a_null_token_count_reads_as_zero_rather_than_dropping_the_line() {
+        let line = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T08:00:05.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":null,"cache_read_input_tokens":30,"cache_creation_input_tokens":null}}}"#;
+        let entry = parse_line(line, "alpha").expect("a null count must not drop the line");
+        assert_eq!(entry.input, 10);
+        assert_eq!(entry.output, 0);
+        assert_eq!(entry.cache_read, 30);
+        assert_eq!(entry.cache_write_5m, 0);
+    }
+
+    /// The same rule one level down, in the TTL split, where a null would
+    /// otherwise be doubly expensive: the line carries a
+    /// `cache_creation_input_tokens` aggregate that would have been counted
+    /// had the split not failed the parse.
+    #[test]
+    fn a_null_inside_the_cache_ttl_split_reads_as_zero_too() {
+        let line = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T08:00:05.000Z","message":{"model":"m","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":null,"ephemeral_1h_input_tokens":25}}}}"#;
+        let entry = parse_line(line, "alpha").expect("a null count must not drop the line");
+        assert_eq!(entry.cache_write_1h, 25);
+        assert_eq!(
+            entry.cache_write_5m, 15,
+            "the null 5m field is zero, and the unattributed remainder still lands there"
+        );
+    }
+
+    /// A line with no `timestamp` is dropped, not dated `Utc::now()`. The
+    /// old fallback put an arbitrarily old request on *today's* row and made
+    /// the same transcript summarize differently either side of midnight,
+    /// and every figure in this tab is grouped by day. It also brings the
+    /// missing case in line with the unparseable one below, which serde has
+    /// always failed.
+    ///
+    /// The line is otherwise complete — a real model and real counts — so
+    /// this fails if the timestamp guard is deleted rather than passing
+    /// because nothing here would parse anyway.
+    #[test]
+    fn a_line_with_no_timestamp_is_dropped_rather_than_dated_today() {
+        let usable = r#"{"type":"assistant","requestId":"r1","timestamp":"2026-09-07T08:00:05.000Z","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        assert!(
+            parse_line(usable, "alpha").is_some(),
+            "the same line with a timestamp does parse"
+        );
+
+        let undated = r#"{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        assert!(parse_line(undated, "alpha").is_none());
+
+        let unparseable = r#"{"type":"assistant","requestId":"r1","timestamp":"the day before yesterday","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        assert!(
+            parse_line(unparseable, "alpha").is_none(),
+            "the two ways of having no date behave the same"
+        );
+    }
+
+    /// A `.jsonl` sitting directly in the root rather than inside a project
+    /// directory was skipped in full: the walk treated every root child as a
+    /// directory, `read_dir` on a file fails, and the failure is a silent
+    /// skip. Every token in it went missing from the totals with nothing on
+    /// screen to say so.
+    ///
+    /// The project directory beside it is what makes this a test of the new
+    /// branch rather than of the walk in general — the ordinary path has to
+    /// keep working, and the loose file's spend has to be additional to it.
+    #[test]
+    fn a_transcript_directly_in_the_root_is_read_rather_than_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-Users-me-Projects-alpha");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let line = |id: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","timestamp":"2026-09-07T08:00:00.000Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":{input},"output_tokens":0}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(project.join("session.jsonl"), line("in-project", 10)).unwrap();
+        std::fs::write(dir.path().join("loose-session.jsonl"), line("loose", 20)).unwrap();
+
+        let mut offsets = HashMap::new();
+        let mut entries = scan_dir(dir.path(), &mut offsets);
+        entries.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+
+        assert_eq!(entries.len(), 2, "both transcripts must be read");
+        assert_eq!(entries[0].request_id, "in-project");
+        assert_eq!(entries[0].project, "-Users-me-Projects-alpha");
+        assert_eq!(entries[1].request_id, "loose");
+        assert_eq!(
+            entries[1].project, "loose-session",
+            "with no project directory to name it, the file's own stem does"
+        );
     }
 
     #[test]

@@ -439,6 +439,90 @@ mod tests {
         }
     }
 
+    /// The tie-break's own claim, which nothing tested: buckets equal on
+    /// cost and on tokens must not swap places between polls. `groups` is a
+    /// `HashMap` and `sort_by` is stable, so without the final
+    /// `a.name.cmp(&b.name)` the order is whatever iteration happens to
+    /// give, and the list reshuffles under the user every time the panel
+    /// refreshes.
+    ///
+    /// Eight tied buckets rather than two, because two would come out
+    /// alphabetical by luck about half the time even with the tie-break
+    /// gone. Both insertion orders have to agree as well, which is the
+    /// "between polls" half — the same content assembled twice.
+    #[test]
+    fn buckets_tied_on_cost_and_tokens_are_ordered_by_name_not_by_hash_order() {
+        let tied = |names: &[&str]| -> Vec<String> {
+            let groups: HashMap<String, Totals> = names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        Totals {
+                            tokens: 10,
+                            cost: 1.0,
+                            unpriced_tokens: 0,
+                        },
+                    )
+                })
+                .collect();
+            bucket(groups).into_iter().map(|b| b.name).collect()
+        };
+
+        let names = [
+            "hotel", "golf", "foxtrot", "echo", "delta", "charlie", "bravo", "alpha",
+        ];
+        let mut alphabetical: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        alphabetical.sort();
+
+        assert_eq!(tied(&names), alphabetical);
+        let mut reversed = names;
+        reversed.reverse();
+        assert_eq!(
+            tied(&reversed),
+            alphabetical,
+            "the order must not depend on how the map was filled"
+        );
+    }
+
+    /// And the tie-break is the *last* term, not the first: a bucket that
+    /// cost more still outranks one whose name sorts earlier. Asserted
+    /// because the fix for a reshuffling list could otherwise be to sort by
+    /// name and lose the cost ranking entirely.
+    #[test]
+    fn the_name_tie_break_never_outranks_cost_or_tokens() {
+        let mut groups: HashMap<String, Totals> = HashMap::new();
+        groups.insert(
+            "zulu".into(),
+            Totals {
+                tokens: 10,
+                cost: 9.0,
+                unpriced_tokens: 0,
+            },
+        );
+        groups.insert(
+            "alpha".into(),
+            Totals {
+                tokens: 10,
+                cost: 1.0,
+                unpriced_tokens: 0,
+            },
+        );
+        // Same cost as `alpha`, more tokens: tokens break the cost tie
+        // before the name does.
+        groups.insert(
+            "yankee".into(),
+            Totals {
+                tokens: 99,
+                cost: 1.0,
+                unpriced_tokens: 0,
+            },
+        );
+
+        let names: Vec<String> = bucket(groups).into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["zulu", "yankee", "alpha"]);
+    }
+
     /// The webview reads these names, so the serialized shape is part of the
     /// contract with `AnalyticsTab.svelte` — `by_model` must arrive as
     /// `byModel`, and the field the tab needs to warn about unpriced models
