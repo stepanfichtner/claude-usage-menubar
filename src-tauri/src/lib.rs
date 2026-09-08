@@ -484,6 +484,71 @@ mod tests {
         );
     }
 
+    /// Two quotas as percentages only, which is the shortest thing a
+    /// separator can sit between. Countdowns are left off on purpose: what
+    /// is under test is the join, and a clock in the expected string would
+    /// only add a way for it to fail for another reason.
+    fn separator_settings(separator: tray::TitleSeparator) -> settings::Settings {
+        settings::Settings {
+            title_entries: vec![
+                tray::TitleEntry {
+                    quota_id: "session".into(),
+                    show_percent: true,
+                    show_countdown: false,
+                },
+                tray::TitleEntry {
+                    quota_id: "weekly_all".into(),
+                    show_percent: true,
+                    show_countdown: false,
+                },
+            ],
+            title_separator: separator,
+            ..settings::Settings::default()
+        }
+    }
+
+    /// The whole path the choice travels, with nothing between the ends
+    /// stubbed: the settings window's value → `save` → the store file →
+    /// `load` → `render_title` → the string handed to the menu bar. The
+    /// unit tests in `tray::render` pin what each glyph looks like; this is
+    /// the one that fails if `title_for` renders with anything other than
+    /// the separator that was saved — passing `TitleSeparator::default()`
+    /// there, say, which every test in `render.rs` would survive.
+    ///
+    /// The first save is what makes the second mean something: the same two
+    /// quotas, the same call, under today's default join.
+    #[test]
+    fn a_saved_separator_reaches_the_menu_bar_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(Arc::new(tray::LastSnapshot::default()));
+
+        let mut snapshot = published_snapshot();
+        snapshot.quotas.push(model::Quota {
+            id: "weekly_all".into(),
+            label: "Weekly".into(),
+            percent: 7.0,
+            severity: model::Severity::from_percent(7.0),
+            resets_at: None,
+            is_active: false,
+        });
+        tray::apply(app.handle(), &snapshot);
+
+        let by_default = set_settings_for(
+            app.handle(),
+            &separator_settings(tray::TitleSeparator::Space),
+        )
+        .unwrap();
+        let with_pipe = set_settings_for(
+            app.handle(),
+            &separator_settings(tray::TitleSeparator::Pipe),
+        )
+        .unwrap();
+
+        assert_eq!(by_default.as_deref(), Some("42%  7%"));
+        assert_eq!(with_pipe.as_deref(), Some("42% | 7%"));
+    }
+
     /// The two halves composed, which neither the store test in `tray` nor
     /// the throttle test above does on its own: sign out, then save. The
     /// signed-out path renders an empty snapshot, so the title a save

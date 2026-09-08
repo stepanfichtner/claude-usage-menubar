@@ -8,11 +8,13 @@
     type TitleEntry,
   } from "./lib/titleEntries";
   import { nextThreshold } from "./lib/thresholds";
-  import { renderTitle } from "./lib/titlePreview";
+  import { renderTitle, separatorGlyph } from "./lib/titlePreview";
+  import type { TitleSeparator } from "./lib/types";
 
   interface Settings {
     pollIntervalSecs: number;
     titleEntries: TitleEntry[];
+    titleSeparator: TitleSeparator;
     thresholds: number[];
     notificationsEnabled: boolean;
     launchAtLogin: boolean;
@@ -32,6 +34,25 @@
 
   function isKnownPollInterval(value: number): boolean {
     return POLL_INTERVAL_PRESETS.some((preset) => preset.value === value);
+  }
+
+  // The whole set, in the order the menu offers it. Names only: the mark
+  // beside each one is read from `separatorGlyph`, which mirrors the Rust
+  // `TitleSeparator::glyph` the menu bar actually draws with, so this list
+  // cannot come to advertise a mark different from the one that lands in the
+  // menu bar. `TitleSeparator` is the union of the names the store holds, so
+  // a value that is not one of them fails `pnpm check` rather than being
+  // sanitised away at run time and silently doing nothing.
+  const TITLE_SEPARATOR_OPTIONS: { value: TitleSeparator; label: string }[] = [
+    { value: "space", label: "Space" },
+    { value: "pipe", label: "Pipe" },
+    { value: "diamond", label: "Diamond" },
+    { value: "slash", label: "Slash" },
+  ];
+
+  function separatorOptionLabel(option: { value: TitleSeparator; label: string }): string {
+    const mark = separatorGlyph(option.value).trim();
+    return mark === "" ? option.label : `${option.label}   ${mark}`;
   }
 
   let settings = $state<Settings | null>(null);
@@ -114,7 +135,14 @@
   // round trip. `renderTitle` (src/lib/titlePreview.ts) mirrors
   // `tray::render_title` on the Rust side and carries its own tests.
   let previewTitle = $derived(
-    settings ? renderTitle($snapshot?.snapshot.quotas ?? [], settings.titleEntries, $now) : "",
+    settings
+      ? renderTitle(
+          $snapshot?.snapshot.quotas ?? [],
+          settings.titleEntries,
+          settings.titleSeparator,
+          $now,
+        )
+      : "",
   );
 
   async function persist() {
@@ -281,6 +309,19 @@
             {/each}
           </div>
 
+          <!-- Above the preview, and outside the per-quota list, because it
+               governs the whole title rather than any one limit: it is what
+               stands between the groups, and the preview underneath shows
+               that the moment it changes. -->
+          <label class="separator">
+            Separate limits with
+            <select bind:value={settings.titleSeparator}>
+              {#each TITLE_SEPARATOR_OPTIONS as option (option.value)}
+                <option value={option.value}>{separatorOptionLabel(option)}</option>
+              {/each}
+            </select>
+          </label>
+
           <div class="preview">
             <span class="preview-label">Menu bar preview</span>
             <span class="preview-value">{previewTitle || "(nothing shown)"}</span>
@@ -442,8 +483,14 @@
   }
   .quota-group .check { padding: 2px 0; font-size: 12px; }
 
+  /* The control and the preview travel together at the foot of the panel:
+     the preview is what makes the choice legible, and free space opening
+     between them would read as two unrelated things. The `auto` sits here
+     rather than on `.preview` for that reason — two of them in one flex
+     column split the free space and put the gap back. */
+  .separator { margin-top: auto; }
+
   .preview {
-    margin-top: auto;
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -458,12 +505,14 @@
     border-radius: 6px;
     padding: 8px 10px;
     font-size: 13px;
-    /* `renderTitle` joins entries with two literal spaces (mirroring
-       `tray.rs`'s own join) specifically to keep separate quotas apart from
-       each other and from the " · " within one quota's segment. Plain
-       `white-space` would collapse that pair to one space, making the two
-       gaps indistinguishable; `pre-wrap` preserves it while still wrapping
-       at whitespace when the line is too long for the box. */
+    /* Under the default separator `renderTitle` joins entries with two
+       literal spaces (mirroring `render.rs`'s own join), which is the whole
+       distance between one quota and the next. Plain `white-space` would
+       collapse that pair to one space, making it identical to the gaps
+       around the " · " inside a segment — the preview would then show a
+       title the menu bar never draws. `pre-wrap` preserves it, and the
+       single spaces around the other marks, while still wrapping at
+       whitespace when the line is too long for the box. */
     white-space: pre-wrap;
     overflow-wrap: break-word;
   }

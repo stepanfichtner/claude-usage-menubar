@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
 
-use crate::tray::TitleEntry;
+use crate::tray::{TitleEntry, TitleSeparator};
 
 pub const STORE_FILE: &str = "settings.json";
 
@@ -28,6 +28,12 @@ pub const MAX_POLL_INTERVAL_SECS: u64 = 24 * 60 * 60;
 pub struct Settings {
     pub poll_interval_secs: u64,
     pub title_entries: Vec<TitleEntry>,
+    /// Added after 0.1.0. The `default` on the container above is what makes
+    /// a store written before it load without any migration: serde fills a
+    /// missing field from `Settings::default()`, which is `Space` — the join
+    /// 0.1.0 rendered. `a_store_from_before_this_setting_loads_unchanged`
+    /// holds that against a real store file, field by field.
+    pub title_separator: TitleSeparator,
     pub thresholds: Vec<u8>,
     pub notifications_enabled: bool,
     pub launch_at_login: bool,
@@ -39,6 +45,7 @@ impl Default for Settings {
         Self {
             poll_interval_secs: 60,
             title_entries: TitleEntry::defaults(),
+            title_separator: TitleSeparator::Space,
             thresholds: vec![50, 80, 90],
             notifications_enabled: true,
             launch_at_login: false,
@@ -60,6 +67,14 @@ impl Settings {
             self.thresholds.dedup();
         } else {
             self.thresholds.clear();
+        }
+        // A separator name this build does not know — written by a newer
+        // build, or by hand — is not trusted into the rest of the app. It
+        // becomes the default here rather than at the point of rendering, so
+        // that what the settings window is shown, what a save writes back and
+        // what the menu bar draws are all the same value.
+        if self.title_separator == TitleSeparator::Unknown {
+            self.title_separator = TitleSeparator::default();
         }
         self
     }
@@ -104,6 +119,11 @@ pub(crate) mod tests {
         assert!(!settings.analytics_enabled, "analytics is off by default");
         assert!(!settings.launch_at_login);
         assert_eq!(settings.title_entries, TitleEntry::defaults());
+        assert_eq!(
+            settings.title_separator,
+            TitleSeparator::Space,
+            "the default join is the one 0.1.0 rendered"
+        );
     }
 
     #[test]
@@ -195,6 +215,43 @@ pub(crate) mod tests {
         assert_eq!(settings.thresholds, vec![1, 100]);
     }
 
+    /// The store is not trusted to name a separator this build knows. A
+    /// newer build could have written one, or a hand edit could have invented
+    /// one, and either way the menu bar has to draw something — so it draws
+    /// the default. Asserted on `sanitized` itself because that is the one
+    /// gate both `load` and `save` pass through: `Unknown` reaching either
+    /// side of it means the settings window shows a choice the store does not
+    /// hold, or the store keeps a name nothing can render.
+    #[test]
+    fn sanitized_replaces_a_separator_name_this_build_does_not_know() {
+        let settings = Settings {
+            title_separator: TitleSeparator::Unknown,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(settings.title_separator, TitleSeparator::Space);
+    }
+
+    /// And a name it does know is left exactly as it is — without this, a
+    /// `sanitized` that simply overwrote the field would satisfy the test
+    /// above and quietly make the setting unusable.
+    #[test]
+    fn sanitized_leaves_a_chosen_separator_alone() {
+        for chosen in [
+            TitleSeparator::Space,
+            TitleSeparator::Pipe,
+            TitleSeparator::Diamond,
+            TitleSeparator::Slash,
+        ] {
+            let settings = Settings {
+                title_separator: chosen,
+                ..Settings::default()
+            }
+            .sanitized();
+            assert_eq!(settings.title_separator, chosen);
+        }
+    }
+
     #[test]
     fn disabling_notifications_empties_the_threshold_list() {
         let settings = Settings {
@@ -228,6 +285,7 @@ pub(crate) mod tests {
         let once = Settings {
             poll_interval_secs: 5,
             thresholds: vec![90, 50, 50, 0, 101, 80],
+            title_separator: TitleSeparator::Unknown,
             ..Settings::default()
         }
         .sanitized();
@@ -306,5 +364,126 @@ pub(crate) mod tests {
 
         let loaded = load(handle);
         assert_eq!(loaded, Settings::default());
+    }
+
+    /// Seeds a store file with `settings` set to `json`, exactly as the
+    /// plugin would find it on its first read, and loads it. The same
+    /// mechanism `load_survives_a_corrupt_store_file_without_panicking` uses,
+    /// with valid content.
+    fn load_from_store_file(handle: &AppHandle<tauri::test::MockRuntime>, json: &str) -> Settings {
+        let data_dir = tauri::Manager::path(handle).app_data_dir().unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join(STORE_FILE),
+            format!("{{\"settings\":{json}}}"),
+        )
+        .unwrap();
+        load(handle)
+    }
+
+    /// The compatibility promise, against a real store file. The JSON below
+    /// is the shape 0.1.0's `Settings` serialized to — those six fields,
+    /// those names, that order, and no `titleSeparator` (checked against
+    /// `git show v0.1.0:src-tauri/src/settings.rs`) — and it has to load with
+    /// no migration step of any kind.
+    ///
+    /// Every value in it but `notificationsEnabled` differs from
+    /// `Settings::default()`, and that one has to stay `true` or `sanitized`
+    /// would empty the thresholds this is watching. The difference is what
+    /// makes the assertions mean something: if the missing field made serde
+    /// reject the object, `load` would fall back to `Settings::default()` and
+    /// they would fail together rather than the separator failing alone.
+    /// Removing `default` from the container attribute is that mutation, and
+    /// it does fail this test.
+    ///
+    /// What this does not assert is what `Space` then renders. That is
+    /// `render_title`'s own table, whose first row is the two-space join this
+    /// file was written under.
+    #[test]
+    fn a_store_from_before_this_setting_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::scoped_to(dir.path());
+        let app = mock_app_with_store();
+
+        let loaded = load_from_store_file(
+            app.handle(),
+            r#"{"pollIntervalSecs":300,"titleEntries":[{"quotaId":"session","showPercent":true,"showCountdown":false}],"thresholds":[75],"notificationsEnabled":true,"launchAtLogin":true,"analyticsEnabled":true}"#,
+        );
+
+        assert_eq!(
+            loaded.title_separator,
+            TitleSeparator::Space,
+            "a store with no separator in it must render the way it always did"
+        );
+        assert_eq!(loaded.poll_interval_secs, 300);
+        assert_eq!(
+            loaded.title_entries,
+            vec![TitleEntry {
+                quota_id: "session".into(),
+                show_percent: true,
+                show_countdown: false,
+            }]
+        );
+        assert_eq!(loaded.thresholds, vec![75]);
+        assert!(loaded.notifications_enabled);
+        assert!(loaded.launch_at_login);
+        assert!(loaded.analytics_enabled);
+    }
+
+    /// The same store one version the other way: a separator name only a
+    /// newer build knows. It is not rendered — `sanitized` puts the default
+    /// back — and, just as importantly, it costs nothing else in the file.
+    /// A derived `Deserialize` fails on an unknown variant, `load` swallows
+    /// that failure as `unwrap_or_default`, and the user's poll interval,
+    /// thresholds and title entries would all be silently reset by one
+    /// unfamiliar word.
+    #[test]
+    fn an_unrecognised_separator_is_replaced_without_losing_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::scoped_to(dir.path());
+        let app = mock_app_with_store();
+
+        let loaded = load_from_store_file(
+            app.handle(),
+            r#"{"pollIntervalSecs":300,"titleEntries":[],"titleSeparator":"arrow","thresholds":[75],"notificationsEnabled":true,"launchAtLogin":true,"analyticsEnabled":false}"#,
+        );
+
+        assert_eq!(loaded.title_separator, TitleSeparator::Space);
+        assert_eq!(
+            loaded.poll_interval_secs, 300,
+            "the rest of the store survived"
+        );
+        assert_eq!(loaded.thresholds, vec![75]);
+        assert!(loaded.launch_at_login);
+    }
+
+    /// The ordinary round trip, through the same store the app uses: a
+    /// chosen separator is written by `save` and comes back from `load`. Both
+    /// halves matter — `save` serializes it under the name `load` parses, and
+    /// neither `sanitized` pass along the way replaces a choice the user
+    /// actually made.
+    #[test]
+    fn a_chosen_separator_survives_a_save_and_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::scoped_to(dir.path());
+        let app = mock_app_with_store();
+        let handle = app.handle();
+
+        for chosen in [
+            TitleSeparator::Pipe,
+            TitleSeparator::Diamond,
+            TitleSeparator::Slash,
+            TitleSeparator::Space,
+        ] {
+            save(
+                handle,
+                &Settings {
+                    title_separator: chosen,
+                    ..Settings::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(load(handle).title_separator, chosen, "{chosen:?}");
+        }
     }
 }

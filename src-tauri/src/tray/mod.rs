@@ -222,8 +222,13 @@ fn title_for<R: Runtime>(
     snapshot: &UsageSnapshot,
     now: DateTime<Utc>,
 ) -> String {
-    let entries = crate::settings::load(app).title_entries;
-    render_title(&snapshot.quotas, &entries, now)
+    let settings = crate::settings::load(app);
+    render_title(
+        &snapshot.quotas,
+        &settings.title_entries,
+        settings.title_separator,
+        now,
+    )
 }
 
 /// Re-renders the menu-bar title from the last snapshot `apply` stored, with

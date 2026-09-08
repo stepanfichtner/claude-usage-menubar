@@ -6,7 +6,7 @@
 //! module.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::model::{Quota, Severity};
 
@@ -33,6 +33,99 @@ impl TitleEntry {
                 show_countdown: true,
             },
         ]
+    }
+}
+
+/// What goes between one quota's segment and the next in the menu-bar title.
+///
+/// The parts *within* a segment are already joined by `" · "` — percentage,
+/// then countdown — so the whole job of a group separator is to be something
+/// that middle dot cannot be mistaken for at menu-bar size. That is what
+/// rules out the obvious candidate: a bullet (`•`) is a middle dot at twice
+/// the diameter, and telling the two apart by size is exactly the judgement
+/// this setting exists to spare the reader. The three visible marks differ
+/// from `·` in shape rather than in size — a full-height stroke, a diamond,
+/// a diagonal.
+///
+/// `Space` is the two literal spaces 0.1.0 rendered, and stays the default:
+/// nobody's menu bar changes until they ask it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleSeparator {
+    #[default]
+    Space,
+    Pipe,
+    Diamond,
+    Slash,
+    /// A name this build does not know: written by a newer build, or by
+    /// hand. Deserializing lands here instead of failing, because failing
+    /// would take the whole `Settings` down with it — one unreadable field
+    /// would silently reset the poll interval, the thresholds and the title
+    /// entries too. `Settings::sanitized` replaces it on every load and
+    /// every save, so it is not a value the rest of the app has to think
+    /// about; `glyph` still answers for it, so even an unsanitized one
+    /// renders today's title rather than panicking.
+    Unknown,
+}
+
+impl TitleSeparator {
+    /// What is actually inserted between two segments, spacing included.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            TitleSeparator::Space => "  ",
+            TitleSeparator::Pipe => " | ",
+            TitleSeparator::Diamond => " ◆ ",
+            TitleSeparator::Slash => " / ",
+            // Deliberately the default's glyph rather than a second literal:
+            // an unrecognised choice should leave the menu bar exactly as it
+            // was, and that stays true if the default's spacing is ever
+            // revised.
+            TitleSeparator::Unknown => Self::default().glyph(),
+        }
+    }
+
+    /// The name this choice is stored under in `settings.json` and sent to
+    /// the settings window under. Paired with `from_stored_name` below —
+    /// both directions written out here, rather than derived on one side and
+    /// hand-matched on the other, so a name can only be changed in one
+    /// place. `separator_names_round_trip_through_their_stored_form` holds
+    /// the pair together.
+    fn stored_name(self) -> &'static str {
+        match self {
+            TitleSeparator::Space => "space",
+            TitleSeparator::Pipe => "pipe",
+            TitleSeparator::Diamond => "diamond",
+            TitleSeparator::Slash => "slash",
+            TitleSeparator::Unknown => "unknown",
+        }
+    }
+
+    fn from_stored_name(name: &str) -> Self {
+        match name {
+            "space" => TitleSeparator::Space,
+            "pipe" => TitleSeparator::Pipe,
+            "diamond" => TitleSeparator::Diamond,
+            "slash" => TitleSeparator::Slash,
+            _ => TitleSeparator::Unknown,
+        }
+    }
+}
+
+impl Serialize for TitleSeparator {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.stored_name())
+    }
+}
+
+/// Written by hand for one reason: a derived `Deserialize` rejects a name it
+/// does not know, and `settings::load` reads the whole `Settings` in one
+/// `from_value` — so a value only a newer build understands would discard
+/// every other setting alongside it. An unknown *name* becomes
+/// `TitleSeparator::Unknown` here and is normalised by `sanitized`. An
+/// unknown *type* (a number, an object) is still an error, which is how
+/// every other field in the store behaves.
+impl<'de> Deserialize<'de> for TitleSeparator {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_stored_name(&String::deserialize(deserializer)?))
     }
 }
 
@@ -68,7 +161,21 @@ pub fn format_long(until: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-pub fn render_title(quotas: &[Quota], entries: &[TitleEntry], now: DateTime<Utc>) -> String {
+/// The menu-bar title: one segment per entry, each `percent · countdown`,
+/// joined by `separator`. An entry with nothing to show — no figures ticked,
+/// or no quota in this snapshot to take them from — drops out before the
+/// join, so it never leaves a separator behind with nothing on one side of
+/// it.
+///
+/// Mirrored by `renderTitle` in `src/lib/titlePreview.ts`, which the settings
+/// window's live preview draws with; the two case tables are written to match
+/// each other string for string.
+pub fn render_title(
+    quotas: &[Quota],
+    entries: &[TitleEntry],
+    separator: TitleSeparator,
+    now: DateTime<Utc>,
+) -> String {
     entries
         .iter()
         .filter_map(|entry| {
@@ -89,7 +196,7 @@ pub fn render_title(quotas: &[Quota], entries: &[TitleEntry], now: DateTime<Utc>
             }
         })
         .collect::<Vec<_>>()
-        .join("  ")
+        .join(separator.glyph())
 }
 
 /// The text rows in the tray menu. On Linux this is the only glanceable
@@ -339,7 +446,12 @@ mod tests {
             quota("weekly_all", 2.0, 6 * 24 * 60),
         ];
         assert_eq!(
-            render_title(&quotas, &TitleEntry::defaults(), now()),
+            render_title(
+                &quotas,
+                &TitleEntry::defaults(),
+                TitleSeparator::Space,
+                now()
+            ),
             "20% · 3h58m  2% · 6d0h"
         );
     }
@@ -352,14 +464,22 @@ mod tests {
             show_percent: true,
             show_countdown: false,
         }];
-        assert_eq!(render_title(&quotas, &entries, now()), "20%");
+        assert_eq!(
+            render_title(&quotas, &entries, TitleSeparator::Space, now()),
+            "20%"
+        );
     }
 
     #[test]
     fn entries_naming_an_absent_quota_are_skipped_silently() {
         let quotas = vec![quota("session", 20.0, 238)];
         assert_eq!(
-            render_title(&quotas, &TitleEntry::defaults(), now()),
+            render_title(
+                &quotas,
+                &TitleEntry::defaults(),
+                TitleSeparator::Space,
+                now()
+            ),
             "20% · 3h58m"
         );
     }
@@ -367,7 +487,7 @@ mod tests {
     #[test]
     fn an_empty_entry_list_renders_nothing() {
         let quotas = vec![quota("session", 20.0, 238)];
-        assert_eq!(render_title(&quotas, &[], now()), "");
+        assert_eq!(render_title(&quotas, &[], TitleSeparator::Space, now()), "");
     }
 
     #[test]
@@ -382,9 +502,223 @@ mod tests {
                     show_percent: true,
                     show_countdown: true
                 }],
+                TitleSeparator::Space,
                 now()
             ),
             "0%"
+        );
+    }
+
+    /// The three entries of the complaint this setting answers, under every
+    /// separator: `24% · 4h1m  33%  3%` cannot be read as three groups,
+    /// because the gap between groups is the same gap as the one inside the
+    /// first. Three entries rather than two on purpose — with two, a
+    /// separator inserted once (after the first segment only) would look
+    /// exactly like one joining every pair.
+    ///
+    /// Mirrored case for case by `renderTitle`'s
+    /// "puts the chosen separator between every pair of entries" in
+    /// `src/lib/titlePreview.test.ts`, with these same expected strings.
+    #[test]
+    fn every_separator_joins_each_pair_of_entries_with_its_own_glyph() {
+        let quotas = vec![
+            quota("session", 24.0, 241),
+            quota("weekly_all", 33.0, 6 * 24 * 60),
+            quota("weekly:Fable", 3.0, 6 * 24 * 60),
+        ];
+        let entries = vec![
+            TitleEntry {
+                quota_id: "session".into(),
+                show_percent: true,
+                show_countdown: true,
+            },
+            TitleEntry {
+                quota_id: "weekly_all".into(),
+                show_percent: true,
+                show_countdown: false,
+            },
+            TitleEntry {
+                quota_id: "weekly:Fable".into(),
+                show_percent: true,
+                show_countdown: false,
+            },
+        ];
+
+        for (separator, expected) in [
+            (TitleSeparator::Space, "24% · 4h1m  33%  3%"),
+            (TitleSeparator::Pipe, "24% · 4h1m | 33% | 3%"),
+            (TitleSeparator::Diamond, "24% · 4h1m ◆ 33% ◆ 3%"),
+            (TitleSeparator::Slash, "24% · 4h1m / 33% / 3%"),
+        ] {
+            assert_eq!(
+                render_title(&quotas, &entries, separator, now()),
+                expected,
+                "{separator:?}"
+            );
+        }
+    }
+
+    /// A separator separates, and nothing else: with one segment there is
+    /// nothing for it to stand between, and with none there is nothing at
+    /// all. Both rows run under every choice, which keeps this table square
+    /// with the TypeScript mirror's.
+    ///
+    /// Measured rather than assumed: replacing the `join` with a per-entry
+    /// append fails the one-segment row for all four choices — `Space`
+    /// included, whose trailing pair of spaces the menu bar would hide but
+    /// this comparison does not. The empty row survives that mutation, since
+    /// there is nothing to append to; it is here for the boundary, not for
+    /// its strength.
+    #[test]
+    fn nothing_is_separated_from_nothing() {
+        let quotas = vec![quota("session", 20.0, 238)];
+        let one = vec![TitleEntry {
+            quota_id: "session".into(),
+            show_percent: true,
+            show_countdown: true,
+        }];
+
+        for separator in [
+            TitleSeparator::Space,
+            TitleSeparator::Pipe,
+            TitleSeparator::Diamond,
+            TitleSeparator::Slash,
+        ] {
+            assert_eq!(
+                render_title(&quotas, &one, separator, now()),
+                "20% · 3h58m",
+                "one entry, {separator:?}"
+            );
+            assert_eq!(
+                render_title(&quotas, &[], separator, now()),
+                "",
+                "no entries, {separator:?}"
+            );
+        }
+    }
+
+    /// The dropped entries again, this time with a separator visible enough
+    /// to show what dropping them costs if the filter ran after the join:
+    /// `24% | ` for a quota this snapshot does not carry, and `24% |  | 3%`
+    /// for an entry with both boxes unticked.
+    #[test]
+    fn an_entry_that_shows_nothing_leaves_no_separator_behind() {
+        let quotas = vec![quota("session", 24.0, 241), quota("weekly:Fable", 3.0, 60)];
+
+        // An entry whose quota is not in this snapshot at all.
+        let absent = vec![
+            TitleEntry {
+                quota_id: "session".into(),
+                show_percent: true,
+                show_countdown: false,
+            },
+            TitleEntry {
+                quota_id: "weekly_all".into(),
+                show_percent: true,
+                show_countdown: true,
+            },
+        ];
+        assert_eq!(
+            render_title(&quotas, &absent, TitleSeparator::Pipe, now()),
+            "24%"
+        );
+
+        // And an entry between two others with neither figure ticked.
+        let unticked = vec![
+            TitleEntry {
+                quota_id: "session".into(),
+                show_percent: true,
+                show_countdown: false,
+            },
+            TitleEntry {
+                quota_id: "weekly_all".into(),
+                show_percent: false,
+                show_countdown: false,
+            },
+            TitleEntry {
+                quota_id: "weekly:Fable".into(),
+                show_percent: true,
+                show_countdown: false,
+            },
+        ];
+        assert_eq!(
+            render_title(&quotas, &unticked, TitleSeparator::Pipe, now()),
+            "24% | 3%"
+        );
+    }
+
+    /// The rule every offered glyph is chosen under, kept as an assertion so
+    /// that adding a fifth choice has to clear it too: a group separator that
+    /// is a middle dot — or any dot — puts the same mark between groups as
+    /// `render_title` already puts inside one, which is worse than the two
+    /// spaces it replaces. It also has to be visible at all; the invisible
+    /// one is `Space`, and that is the default rather than a choice made to
+    /// mark a boundary.
+    #[test]
+    fn no_offered_separator_can_be_mistaken_for_the_dot_inside_a_segment() {
+        for separator in [
+            TitleSeparator::Pipe,
+            TitleSeparator::Diamond,
+            TitleSeparator::Slash,
+        ] {
+            let glyph = separator.glyph();
+            assert!(
+                !glyph.contains('·'),
+                "{separator:?} uses the intra-segment dot"
+            );
+            assert!(
+                !glyph.contains('•'),
+                "{separator:?} uses a bullet, which is that dot at twice the size"
+            );
+            assert!(!glyph.trim().is_empty(), "{separator:?} has nothing to see");
+        }
+        assert_eq!(
+            TitleSeparator::Space.glyph(),
+            "  ",
+            "the default is the two spaces 0.1.0 rendered, exactly"
+        );
+    }
+
+    /// `stored_name` and `from_stored_name` are the two halves of what a
+    /// `settings.json` holds, and they are written out separately — so this
+    /// walks every variant through both. A name changed on one side only
+    /// would mean a saved choice silently reading back as `Unknown`, and
+    /// from there as the default: the setting would appear to forget itself
+    /// on every restart.
+    #[test]
+    fn separator_names_round_trip_through_their_stored_form() {
+        for separator in [
+            TitleSeparator::Space,
+            TitleSeparator::Pipe,
+            TitleSeparator::Diamond,
+            TitleSeparator::Slash,
+            TitleSeparator::Unknown,
+        ] {
+            let json = serde_json::to_string(&separator).unwrap();
+            let parsed: TitleSeparator = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, separator, "{separator:?} came back as {parsed:?}");
+        }
+        assert_eq!(
+            serde_json::to_string(&TitleSeparator::Pipe).unwrap(),
+            "\"pipe\"",
+            "the stored form is the name, not a number or a glyph"
+        );
+    }
+
+    /// A name only a newer build knows must not be an error: `settings::load`
+    /// parses the whole `Settings` in one go, so a rejected value here would
+    /// take the poll interval, the thresholds and the title entries down with
+    /// it. It parses as `Unknown` — which `Settings::sanitized` replaces (see
+    /// `an_unrecognised_separator_is_replaced_without_losing_the_rest`) and
+    /// which renders as the default even if it somehow arrives unsanitized.
+    #[test]
+    fn a_separator_name_this_build_does_not_know_is_not_an_error() {
+        let parsed: TitleSeparator = serde_json::from_str("\"arrow\"").unwrap();
+        assert_eq!(parsed, TitleSeparator::Unknown);
+        assert_eq!(
+            parsed.glyph(),
+            TitleSeparator::Space.glyph(),
+            "an unknown choice renders as today's title, not as nothing"
         );
     }
 

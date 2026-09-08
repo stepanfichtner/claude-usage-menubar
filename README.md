@@ -15,7 +15,10 @@ the Ubuntu section below.
 ## What it shows
 
 In the menu bar: a crab, coloured by how much of your worst quota is gone, and
-whichever figures you choose — percentage, countdown, or both, per quota.
+whichever figures you choose — percentage, countdown, or both, per quota. With
+more than one limit up there, Settings can put a mark between them — a pipe, a
+diamond or a slash — so the gap between two limits doesn't read like the gap
+inside one. Two spaces, as before, is the default.
 
 | colour | |
 |---|---|
