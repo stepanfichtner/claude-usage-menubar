@@ -12,6 +12,17 @@ pub const STORE_FILE: &str = "settings.json";
 /// measured in hours and days, so a sub-minute poll buys nothing.
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 
+/// The other end of the same range. `poller.rs` turns the interval into a
+/// deadline with `tokio::time::Instant::now() + Duration::from_secs(..)`, and
+/// `Instant::add` panics on overflow — so a hand-edited `settings.json` near
+/// `u64::MAX` would kill the poll task, and tokio swallows that panic: the
+/// tray would sit on its last snapshot, silently, until the next launch. A
+/// day is the ceiling because it is far above the longest interval the
+/// settings window offers (600 s), so nothing reachable through the UI is
+/// touched, and far below anything the addition could choke on. Above a day
+/// the app has stopped being a live indicator anyway.
+pub const MAX_POLL_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -40,7 +51,9 @@ impl Settings {
     /// Coerce anything a hand-edited store file or a stale build could contain
     /// into something the rest of the app can rely on.
     pub fn sanitized(mut self) -> Self {
-        self.poll_interval_secs = self.poll_interval_secs.max(MIN_POLL_INTERVAL_SECS);
+        self.poll_interval_secs = self
+            .poll_interval_secs
+            .clamp(MIN_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS);
         if self.notifications_enabled {
             self.thresholds.retain(|t| *t > 0 && *t <= 100);
             self.thresholds.sort_unstable();
@@ -132,6 +145,32 @@ pub(crate) mod tests {
         }
         .sanitized();
         assert_eq!(settings.poll_interval_secs, 600);
+    }
+
+    /// The ceiling, from both sides. Unlike the floor this is symbolic
+    /// throughout: 60 is a measured value, `MAX_POLL_INTERVAL_SECS` is only a
+    /// bound, and any number comfortably above the settings window's largest
+    /// preset (600 s) and comfortably below `u64::MAX` would do. What is
+    /// load-bearing is that *some* ceiling applies, which is what the
+    /// `u64::MAX` row asserts: drop the ceiling — or turn the `clamp` in
+    /// `sanitized` back into a `max` — and that row comes back as `u64::MAX`
+    /// and this test fails. Why the ceiling is needed at all is asserted in
+    /// poller.rs's `an_absurd_settings_interval_still_yields_a_deadline`.
+    #[test]
+    fn the_poll_interval_ceiling_holds_at_both_ends() {
+        for (given, expected) in [
+            (MAX_POLL_INTERVAL_SECS - 1, MAX_POLL_INTERVAL_SECS - 1),
+            (MAX_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS),
+            (MAX_POLL_INTERVAL_SECS + 1, MAX_POLL_INTERVAL_SECS),
+            (u64::MAX, MAX_POLL_INTERVAL_SECS),
+        ] {
+            let settings = Settings {
+                poll_interval_secs: given,
+                ..Settings::default()
+            }
+            .sanitized();
+            assert_eq!(settings.poll_interval_secs, expected, "input {given}");
+        }
     }
 
     #[test]

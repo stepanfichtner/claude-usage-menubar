@@ -559,6 +559,34 @@ mod tests {
         assert_eq!(backoff.next_delay(BASE), BASE);
     }
 
+    /// The two lines at the top of the poll loop's tail, run against the worst
+    /// interval a hand-edited `settings.json` can still produce. `Instant::add`
+    /// panics on overflow, and a panic in this spawned task is swallowed by
+    /// tokio: the loop would stop, the tray would keep showing its last
+    /// snapshot, and nothing would say so until the next launch. Remove
+    /// `settings::MAX_POLL_INTERVAL_SECS` (or weaken `sanitized`'s `clamp` back
+    /// to a `max`) and the first `+` below panics with `overflow when adding
+    /// duration to instant`, failing this test — checked by doing exactly that.
+    #[tokio::test]
+    async fn an_absurd_settings_interval_still_yields_a_deadline() {
+        let sanitized = crate::settings::Settings {
+            poll_interval_secs: u64::MAX,
+            ..Default::default()
+        }
+        .sanitized();
+        let interval = Duration::from_secs(sanitized.poll_interval_secs);
+        let backoff = Backoff::new();
+
+        let before = tokio::time::Instant::now();
+        let deadline = before + backoff.next_delay(interval);
+
+        assert!(deadline > before);
+        assert!(
+            deadline <= before + Duration::from_secs(crate::settings::MAX_POLL_INTERVAL_SECS),
+            "a sanitized interval must not outrun the ceiling"
+        );
+    }
+
     #[test]
     fn rate_limiting_escalates_2_5_15_and_caps() {
         let mut backoff = Backoff::new();
