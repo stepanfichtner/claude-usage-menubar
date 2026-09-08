@@ -12,6 +12,13 @@ macOS today. The codebase already builds and passes its tests on Ubuntu in CI,
 but 0.1.0 ships macOS only — nobody has run it on real Linux hardware yet. See
 the Ubuntu section below.
 
+<p align="center">
+  <img src=".github/images/panel-limits.png" alt="The Limits tab: two weekly rings and the current session" width="320">
+  <img src=".github/images/panel-usage.png" alt="The Usage tab: local token and cost estimate by model, project and day" width="320">
+</p>
+
+<p align="center"><sub>Example data. The Usage tab is optional and off by default.</sub></p>
+
 ## What it shows
 
 In the menu bar: a crab, coloured by how much of your worst quota is gone, and
@@ -74,15 +81,43 @@ Download the `.dmg` from [Releases](../../releases) and drag the app to
 Applications.
 
 The build is **not code-signed or notarized**, so the first launch is blocked by
-Gatekeeper. Either right-click the app and choose *Open*, or run:
+Gatekeeper. Right-click the app and choose *Open* — that is the same outcome as
+stripping the quarantine flag, but it keeps you inside the OS flow rather than
+teaching a habit of blanket-stripping downloads:
 
 ```bash
+# only if right-click → Open is unavailable to you
 xattr -dr com.apple.quarantine "/Applications/Claude Usage.app"
+```
+
+**What that costs you, stated plainly.** Getting past Gatekeeper this way means
+macOS never assesses the app and never runs its first-launch malware scan, and
+because there is no code signature there is no integrity baseline either — any
+process running as you could modify the installed app afterwards and nothing
+would notice. The updater checks a signature on what it *downloads*; it cannot
+check the copy already on your disk. So installing this is a decision to trust
+this repository's release pipeline. That pipeline pins every CI action to a
+commit hash and signs every update with a key held only in GitHub secrets, which
+is the most that can be offered without an Apple Developer ID.
+
+Verify the download if you like — the SHA-256 of each release artifact is
+published in its release notes:
+
+```bash
+shasum -a 256 ~/Downloads/Claude.Usage_*_universal.dmg
 ```
 
 On first run macOS may ask for permission to read the `Claude Code-credentials`
 Keychain item. Choose **Always Allow** — that item is the OAuth token, and
 reading it is the whole point of the app.
+
+Worth knowing what that button does: because this app is unsigned it has no
+stable code identity, so it reads the item by running Apple's own
+`/usr/bin/security` tool. **Always Allow** therefore adds that general-purpose
+tool to the item's access list, after which any process running as you can read
+the token the same way. Claude Code most likely granted this already when it
+created the item, so this is probably not widening anything — but you should know
+it rather than find out.
 
 ### Ubuntu
 
