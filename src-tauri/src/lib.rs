@@ -237,6 +237,7 @@ pub fn run() {
         .manage(Arc::new(poller::RefreshSignal::default()))
         .manage(Arc::new(updater::UpdateCheckStatus::default()))
         .manage(Arc::new(tray::LastQuotaLines::default()))
+        .manage(Arc::new(tray::LastMenu::default()))
         .manage(Arc::new(tray::LastSnapshot::default()))
         .manage(AnalyticsState::default())
         .setup(|app| {

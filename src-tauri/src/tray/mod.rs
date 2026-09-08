@@ -17,7 +17,7 @@ use crate::model::UsageSnapshot;
 pub const TRAY_ID: &str = "main";
 
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let menu = build_menu(app, &[])?;
+    let menu = build_menu(app, &[], &check_updates_label(app))?;
     // On non-macOS platforms nothing below reads `tray` again — the icon is
     // set once at build time and never switched to a template afterward.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -48,7 +48,25 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn build_menu<R: Runtime>(app: &AppHandle<R>, labels: &[String]) -> tauri::Result<Menu<R>> {
+/// The `Check for Updates…` row's label right now. Falls back to the idle
+/// text when the status was never managed, which no production path does.
+///
+/// Read by the callers rather than inside `build_menu`, because the two
+/// varying inputs to a menu — this and the quota lines — are also what
+/// `LastMenu` compares to decide whether a rebuild would change anything.
+/// Reading it here keeps that comparison looking at the same string the
+/// rebuild would render.
+fn check_updates_label<R: Runtime>(app: &AppHandle<R>) -> String {
+    app.try_state::<std::sync::Arc<crate::updater::UpdateCheckStatus>>()
+        .map(|status| status.label())
+        .unwrap_or_else(|| "Check for Updates…".to_string())
+}
+
+fn build_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    labels: &[String],
+    check_updates_label: &str,
+) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
     for (index, label) in labels.iter().enumerate() {
         let item = MenuItem::with_id(app, format!("quota-{index}"), label, false, None::<&str>)?;
@@ -57,11 +75,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, labels: &[String]) -> tauri::Resul
     if !labels.is_empty() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
-    let check_updates_label = app
-        .try_state::<std::sync::Arc<crate::updater::UpdateCheckStatus>>()
-        .map(|status| status.label())
-        .unwrap_or_else(|| "Check for Updates…".to_string());
-    for row in trailing_rows(check_updates_label) {
+    for row in trailing_rows(check_updates_label.to_string()) {
         match row {
             MenuRow::Item { id, label, enabled } => {
                 menu.append(&MenuItem::with_id(app, id, label, enabled, None::<&str>)?)?;
@@ -103,6 +117,38 @@ fn current_quota_lines<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
     app.try_state::<std::sync::Arc<LastQuotaLines>>()
         .map(|lines| lines.get())
         .unwrap_or_default()
+}
+
+/// What the tray menu currently shows, as the pair `build_menu` was last
+/// called with. Held so `apply` can skip a rebuild that would produce a
+/// byte-identical menu — while signed out there are no quota lines at all
+/// and nothing else changes either, so every poll was reconstructing the
+/// same seven native menu items and handing them to the tray.
+///
+/// The pair is the whole of it: `build_menu`'s only varying inputs are the
+/// quota lines and the `Check for Updates…` label, and everything else it
+/// renders is a literal. The label has to be in here rather than left out as
+/// "not really menu content" — it expires from an outcome back to idle after
+/// `updater::OUTCOME_VISIBLE_FOR`, and the poll-driven rebuild is what
+/// `updater` relies on to notice (see the comment on that constant). Skipping
+/// on unchanged quota lines alone would leave a finished check's result in
+/// the menu until the numbers happened to move.
+#[derive(Default)]
+pub struct LastMenu(std::sync::Mutex<Option<(Vec<String>, String)>>);
+
+impl LastMenu {
+    /// Records what is about to be rendered and reports whether it differs
+    /// from what was rendered before. `true` the first time, so the menu
+    /// after launch is always built.
+    fn changed(&self, lines: &[String], check_updates_label: &str) -> bool {
+        let rendering = (lines.to_vec(), check_updates_label.to_string());
+        let mut last = self.0.lock().unwrap();
+        if last.as_ref() == Some(&rendering) {
+            return false;
+        }
+        *last = Some(rendering);
+        true
+    }
 }
 
 /// The last snapshot `apply` rendered, held so the menu-bar title can be
@@ -216,8 +262,16 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, snapshot: &UsageSnapshot) {
     if let Some(lines) = app.try_state::<std::sync::Arc<LastQuotaLines>>() {
         lines.set(labels.clone());
     }
-    if let Ok(menu) = build_menu(app, &labels) {
-        let _ = tray.set_menu(Some(menu));
+    // Only rebuild when the result would differ. An unmanaged `LastMenu`
+    // means "rebuild every time", which is what this did before.
+    let check_updates = check_updates_label(app);
+    let changed = app
+        .try_state::<std::sync::Arc<LastMenu>>()
+        .is_none_or(|last| last.changed(&labels, &check_updates));
+    if changed {
+        if let Ok(menu) = build_menu(app, &labels, &check_updates) {
+            let _ = tray.set_menu(Some(menu));
+        }
     }
 }
 
@@ -232,7 +286,15 @@ pub fn refresh_menu(app: &AppHandle) {
         return;
     };
     let labels = current_quota_lines(app);
-    if let Ok(menu) = build_menu(app, &labels) {
+    let check_updates = check_updates_label(app);
+    // Unconditional: this is only called because something already changed.
+    // The record is still updated, so `apply`'s skip stays a true statement
+    // about what the tray is showing rather than about what `apply` last
+    // pushed.
+    if let Some(last) = app.try_state::<std::sync::Arc<LastMenu>>() {
+        last.changed(&labels, &check_updates);
+    }
+    if let Ok(menu) = build_menu(app, &labels, &check_updates) {
         let _ = tray.set_menu(Some(menu));
     }
 }
@@ -366,6 +428,39 @@ mod tests {
             current_quota_lines(app.handle()),
             vec!["Label session — 20% · in 3h 58m".to_string()]
         );
+    }
+
+    /// The first menu after launch has nothing to compare against and must
+    /// be built, and an unchanged one after it must not be. That second
+    /// assertion is the whole point: while signed out there are no quota
+    /// lines to change, so every poll was rebuilding seven identical native
+    /// menu items and handing them to the tray.
+    #[test]
+    fn an_unchanged_menu_is_not_rebuilt_after_the_first_one() {
+        let last = LastMenu::default();
+        assert!(last.changed(&[], "Check for Updates…"));
+        assert!(!last.changed(&[], "Check for Updates…"));
+        assert!(!last.changed(&[], "Check for Updates…"));
+    }
+
+    #[test]
+    fn a_changed_quota_line_rebuilds() {
+        let last = LastMenu::default();
+        last.changed(&["Label session — 20% · in 3h 58m".to_string()], "Check…");
+        assert!(last.changed(&["Label session — 21% · in 3h 57m".to_string()], "Check…"));
+    }
+
+    /// The case that decides whether the label belongs in the comparison at
+    /// all. `updater::UpdateCheckStatus` expires a finished check's label
+    /// back to idle lazily, and the poll-driven rebuild is what it relies on
+    /// to notice — so a skip that watched only the quota lines would leave
+    /// "Up to date" sitting in the menu until the numbers happened to move.
+    #[test]
+    fn a_changed_check_updates_label_rebuilds_even_with_identical_quota_lines() {
+        let lines = ["Label session — 20% · in 3h 58m".to_string()];
+        let last = LastMenu::default();
+        last.changed(&lines, "Up to date");
+        assert!(last.changed(&lines, "Check for Updates…"));
     }
 
     /// Every snapshot `apply` renders lands in `LastSnapshot`, and each one
