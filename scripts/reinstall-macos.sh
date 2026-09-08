@@ -6,15 +6,26 @@ APP="Claude Usage.app"
 BUILT="src-tauri/target/release/bundle/macos/$APP"
 DEST="/Applications/$APP"
 
-# Only the .app — never the DMG. A local reinstall copies the bundle straight to
-# /Applications, so the disk image is pure cost: building it mounts a volume,
-# which opens a Finder window, and the unmount then fails against the running
-# copy with "the item is in use" — two dialogs and a red build error for an
-# artifact nothing here consumes. The release DMG is CI's job.
+# Build the .app and nothing else. Two things have to be turned off for that,
+# and each one otherwise ends the build with a failure this script does not
+# care about:
 #
-# `--bundles app` is why this no longer needs `|| true`: with the DMG gone, a
-# non-zero exit means the build actually failed and should stop the script.
-pnpm tauri build --bundles app
+#   --bundles app   skips the DMG. Building it mounts a volume, which opens a
+#                   Finder window, and the unmount then fails against the
+#                   running copy with "the item is in use" — two dialogs for an
+#                   artifact that goes straight in the bin. CI builds the real
+#                   release DMG.
+#   createUpdaterArtifacts=false
+#                   skips the signed .app.tar.gz. It is on in tauri.conf.json
+#                   because the release needs it, and signing it needs
+#                   TAURI_SIGNING_PRIVATE_KEY — which lives in CI secrets and
+#                   must never be on a developer machine. So locally it can
+#                   only ever fail.
+#
+# With both off the build has no reason to fail except a real failure, which is
+# why there is no `|| true` here and why the guard below is a second check
+# rather than the only one.
+pnpm tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
 [ -d "$BUILT" ] || { echo "build produced no $APP — see the output above"; exit 1; }
 
 pkill -f claude-usage-menubar 2>/dev/null || true
