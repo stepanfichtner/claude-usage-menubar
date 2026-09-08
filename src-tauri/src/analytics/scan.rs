@@ -156,10 +156,11 @@ fn jsonl_files_under(dir: &Path) -> Vec<PathBuf> {
             let path = child.path();
             match child.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(path),
-                Ok(kind) if kind.is_file() => {
-                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                        files.push(path);
-                    }
+                Ok(kind)
+                    if kind.is_file()
+                        && path.extension().and_then(|e| e.to_str()) == Some("jsonl") =>
+                {
+                    files.push(path);
                 }
                 _ => {}
             }
