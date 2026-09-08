@@ -195,10 +195,33 @@ already accounts for this: it treats a non-zero exit from `tauri build` as
 non-fatal and checks for the `.app` directly rather than trusting the exit
 code.
 
+### Tests
+
+Two suites. `.github/workflows/ci.yml` runs exactly this on every push:
+
+```bash
+cd src-tauri
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all          # polling, parsing, tray text, settings, updater
+
+cd ..
+pnpm exec tsc --noEmit
+pnpm check                # svelte-check
+pnpm test                 # vitest, over src/lib
+pnpm build
+```
+
+CI pins Rust to `dtolnay/rust-toolchain@stable`, so a clippy pass on an older
+local toolchain does not predict it. If CI reports a lint you cannot
+reproduce, check `rustc --version` before anything else.
+
 ## Releasing
 
 Bump the version in `src-tauri/Cargo.toml` (the single source of truth —
-`tauri.conf.json` inherits it), merge to `main`, then tag and push:
+`tauri.conf.json` inherits it, the popover footer and the User-Agent read
+`CARGO_PKG_VERSION`, and `package.json` deliberately carries no version at
+all, being private and unpublished), merge to `main`, then tag and push:
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0

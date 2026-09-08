@@ -1,7 +1,6 @@
 {
   "name": "claude-usage-menubar",
   "private": true,
-  "version": "0.1.0",
   "description": "Menu bar monitor for Claude subscription usage limits",
   "license": "MIT",
   "type": "module",
@@ -16,10 +15,7 @@
   },
   "dependencies": {
     "@lucide/svelte": "^1.42.0",
-    "@tauri-apps/api": "2",
-    "@tauri-apps/plugin-autostart": "^2.5.1",
-    "@tauri-apps/plugin-notification": "^2.4.0",
-    "@tauri-apps/plugin-store": "^2.4.4"
+    "@tauri-apps/api": "2"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7",
