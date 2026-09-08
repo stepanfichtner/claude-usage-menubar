@@ -1,5 +1,5 @@
 :root {
-  --bg: rgba(255, 255, 255, 0.86);
+  --bg: #ffffff;
   --fg: #09090b;
   --fg-muted: #71717a;
   --border: #e4e4e7;
@@ -17,7 +17,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: rgba(9, 9, 11, 0.86);
+    --bg: #000000;
     --fg: #fafafa;
     --fg-muted: #a1a1aa;
     --border: #27272a;

@@ -230,8 +230,14 @@
 
 <style>
   main {
+    /* Opaque, and no `backdrop-filter`. The panel used to be 86% opaque with a
+       30px blur behind it, which produced the flicker on every open: the window
+       is `transparent: true`, so WebKit paints the frame before the backdrop is
+       composited and you see straight through it for a frame, then the blur
+       lands. Nothing to see through and nothing to compose late means nothing
+       to flicker. The window stays transparent so the 12px corners keep their
+       rounding — that is the only thing the transparency is still for. */
     background: var(--bg);
-    backdrop-filter: blur(30px);
     border-radius: 12px;
     padding: 6px;
     /* Not `height: 100vh` — that would force `main.scrollHeight` (what the
