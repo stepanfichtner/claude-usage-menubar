@@ -166,7 +166,7 @@ fn app_version() -> &'static str {
 #[tauri::command]
 fn set_settings(app: tauri::AppHandle, settings: settings::Settings) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
-    settings::save(&app, &settings)?;
+    set_settings_for(&app, &settings)?;
 
     let manager = app.autolaunch();
     let autostart_result = if settings.launch_at_login {
@@ -177,16 +177,51 @@ fn set_settings(app: tauri::AppHandle, settings: settings::Settings) -> Result<(
     // A failure here means the store now says `launch_at_login` but the
     // LaunchAgent/.desktop file does not match it — that divergence has to
     // reach the caller rather than being swallowed, so the settings UI can
-    // show it instead of silently lying about what took effect.
-    autostart_result.map_err(|e| e.to_string())?;
+    // show it instead of silently lying about what took effect. It is
+    // reported after the work above rather than before it: the store is
+    // written and the menu bar retitled either way, and what the user just
+    // saved must not go unshown because a LaunchAgent file could not be.
+    autostart_result.map_err(|e| e.to_string())
+}
 
+/// The body of `set_settings`: everything that follows from the settings
+/// having been saved. Generic over the Tauri runtime for the same reason
+/// `summary_for` is — a `#[tauri::command]` takes a concrete `AppHandle`
+/// (= `AppHandle<Wry>`) and needs a real webview, whereas this can be driven
+/// against `tauri::test`'s `MockRuntime`. Only the autostart toggle stays
+/// behind in the command, because it needs a plugin the mock app has no
+/// reason to register.
+///
+/// Returns the menu-bar title it re-rendered, which the command discards; see
+/// `tray::refresh_title` for why it is returned at all.
+fn set_settings_for<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    settings: &settings::Settings,
+) -> Result<Option<String>, String> {
+    settings::save(app, settings)?;
+
+    // Which figures the menu bar shows is a display setting, and the snapshot
+    // it renders is already in hand — so the title is rebuilt here, from that
+    // snapshot, the instant the setting changes. This used to be left to the
+    // refresh below, which is a network fetch: `request()` is refused for
+    // sixty seconds after any refresh (a panel open, or a poll on the default
+    // interval), and even when it is granted the title only changes once the
+    // fetch comes back, so the change a user just saved took until the next
+    // poll to appear — up to ten minutes on the longest interval the settings
+    // window offers.
+    let title = tray::refresh_title(app);
+
+    // Asking for fresh numbers on a settings change is still right, so it
+    // stays. What changed is that it is no longer what makes the title
+    // correct: the two are independent now, and this being refused by the
+    // throttle costs nothing but the numbers being a poll older.
     if let Some(signal) = {
         use tauri::Manager;
         app.try_state::<Arc<poller::RefreshSignal>>()
     } {
         signal.request();
     }
-    Ok(())
+    Ok(title)
 }
 
 pub fn run() {
@@ -202,6 +237,7 @@ pub fn run() {
         .manage(Arc::new(poller::RefreshSignal::default()))
         .manage(Arc::new(updater::UpdateCheckStatus::default()))
         .manage(Arc::new(tray::LastQuotaLines::default()))
+        .manage(Arc::new(tray::LastSnapshot::default()))
         .manage(AnalyticsState::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -329,6 +365,127 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// One quota, shaped like what the poller publishes: 42% used, resetting
+    /// in three hours and twenty minutes. The extra half-minute keeps the
+    /// countdown reading `3h20m` rather than tipping to `3h19m` if the test
+    /// takes a moment to get there.
+    fn published_snapshot() -> model::UsageSnapshot {
+        model::UsageSnapshot {
+            quotas: vec![model::Quota {
+                id: "session".into(),
+                label: "Session".into(),
+                percent: 42.0,
+                severity: model::Severity::from_percent(42.0),
+                resets_at: Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::minutes(200)
+                        + chrono::Duration::seconds(30),
+                ),
+                is_active: true,
+            }],
+            fetched_at: chrono::Utc::now(),
+            stale: false,
+        }
+    }
+
+    /// Settings showing the session quota as percentage only, countdown only,
+    /// or both — the very choice the settings window offers and the bug is
+    /// about.
+    fn title_settings(show_percent: bool, show_countdown: bool) -> settings::Settings {
+        settings::Settings {
+            title_entries: vec![tray::TitleEntry {
+                quota_id: "session".into(),
+                show_percent,
+                show_countdown,
+            }],
+            ..settings::Settings::default()
+        }
+    }
+
+    /// The reported bug, exactly: change which figures the menu bar shows,
+    /// save, and the menu bar does not change. Against the code before the
+    /// fix both saves rendered nothing at all — asking the poller for a fetch
+    /// that would eventually redraw the title was the only thing a save did
+    /// about it.
+    ///
+    /// Both land inside the sixty-second manual-refresh window, which is the
+    /// ordinary state of this app: opening the panel refreshes, and the
+    /// default poll interval is sixty seconds. That the window really is
+    /// closed is asserted on both sides of the saves rather than assumed, so
+    /// a `RefreshThrottle` loosened to let these through — the fix this bug
+    /// does not want — fails here rather than passing.
+    ///
+    /// Two saves, selecting different figures, because each has to render
+    /// under the settings it has just written: re-rendering from anything
+    /// else, the settings on disk a moment earlier included, gives a
+    /// different string here.
+    #[test]
+    fn each_save_retitles_the_menu_bar_even_while_the_refresh_throttle_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(Arc::new(tray::LastSnapshot::default()));
+
+        // A poll has published a snapshot, as one has by the time anyone is
+        // looking at the menu bar to complain about it.
+        tray::apply(app.handle(), &published_snapshot());
+
+        // And something has refreshed inside the last minute: a panel open,
+        // or a poll on the default interval. From here the throttle refuses,
+        // which is the state the bug needs.
+        let signal = Arc::new(poller::RefreshSignal::default());
+        app.handle().manage(signal.clone());
+        assert!(
+            signal.request(),
+            "the first request through is the one that closes the window"
+        );
+        assert!(!signal.request(), "and it refuses from here on");
+
+        let percent_only = set_settings_for(app.handle(), &title_settings(true, false)).unwrap();
+        let countdown_only = set_settings_for(app.handle(), &title_settings(false, true)).unwrap();
+
+        assert_eq!(percent_only.as_deref(), Some("42%"));
+        assert_eq!(countdown_only.as_deref(), Some("3h20m"));
+        assert!(
+            !signal.request(),
+            "and nothing here relaxed the throttle: it is still refusing"
+        );
+    }
+
+    /// The half of the old behaviour that was right and stays: a settings
+    /// change is still a good moment to ask for fresh numbers. A
+    /// `RefreshSignal` nothing has touched lets exactly one request through,
+    /// so if the save made that request the window is closed afterwards, and
+    /// if the save stopped making it the window would still be open.
+    #[test]
+    fn a_save_still_asks_the_poller_for_fresh_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(Arc::new(tray::LastSnapshot::default()));
+        let signal = Arc::new(poller::RefreshSignal::default());
+        app.handle().manage(signal.clone());
+
+        set_settings_for(app.handle(), &title_settings(true, true)).unwrap();
+
+        assert!(
+            !signal.request(),
+            "the save's own request was let through, which is what closed the window"
+        );
+    }
+
+    /// Saving before the first poll has published anything — the settings
+    /// window opens from the menu, which is available immediately — has no
+    /// numbers to render. That has to be an empty answer rather than a panic
+    /// or a blanked title.
+    #[test]
+    fn a_save_before_the_first_snapshot_renders_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_home, app) = scoped_app(dir.path());
+        app.handle().manage(Arc::new(tray::LastSnapshot::default()));
+
+        let rendered = set_settings_for(app.handle(), &title_settings(true, true)).unwrap();
+        assert_eq!(rendered, None);
     }
 
     /// The gate, from the side that matters. Analytics is off by default, and

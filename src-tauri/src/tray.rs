@@ -292,20 +292,103 @@ fn current_quota_lines<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The last snapshot `apply` rendered, held so the menu-bar title can be
+/// rebuilt from it without a fresh one. Which figures the title shows is a
+/// display setting: changing it needs no new numbers, only the numbers
+/// already in hand. Empty until the first `apply` — the launch state, where
+/// there is genuinely nothing to re-render.
+#[derive(Default)]
+pub struct LastSnapshot(std::sync::Mutex<Option<UsageSnapshot>>);
+
+impl LastSnapshot {
+    fn set(&self, snapshot: UsageSnapshot) {
+        *self.0.lock().unwrap() = Some(snapshot);
+    }
+
+    fn get(&self) -> Option<UsageSnapshot> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The snapshot to re-render from, or `None` if none has been stored yet (no
+/// snapshot has arrived, or the state was never managed — same answer either
+/// way, and neither is an error). Split out for the same reason
+/// `current_quota_lines` is: reading managed state needs no main-thread
+/// dispatch, unlike anything that touches a real tray.
+fn current_snapshot<R: Runtime>(app: &AppHandle<R>) -> Option<UsageSnapshot> {
+    app.try_state::<std::sync::Arc<LastSnapshot>>()
+        .and_then(|last| last.get())
+}
+
+/// The menu-bar title for `snapshot` under the settings in force right now.
+/// The single definition of that, used both by `apply` as a snapshot arrives
+/// and by `refresh_title` when the settings change under a stored one, so the
+/// two can never come to disagree about what the title should say.
+fn title_for<R: Runtime>(
+    app: &AppHandle<R>,
+    snapshot: &UsageSnapshot,
+    now: DateTime<Utc>,
+) -> String {
+    let entries = crate::settings::load(app).title_entries;
+    render_title(&snapshot.quotas, &entries, now)
+}
+
+/// Re-renders the menu-bar title from the last snapshot `apply` stored, with
+/// no fetch of any kind. The sibling of `refresh_menu`, and here for the same
+/// reason it is: a user-initiated change has to produce a visible result when
+/// it is made, not when an unrelated timer happens to fire. There the change
+/// was an update check and the timer was `apply`'s next run; here the change
+/// is a settings save and the timer is the poller's next cycle — up to ten
+/// minutes away on the longest poll interval the settings window offers. The
+/// pairing is the one R51 and R52 arrived at together: state to render from,
+/// and a rebuild forced at the moment that state changes, because either one
+/// alone leaves the same silence.
+///
+/// Returns the title it rendered, or `None` when nothing has been stored yet
+/// and there is nothing to render. Returned because a test has no other way
+/// to see it: `MockRuntime` has no tray to read a title back from — the same
+/// `muda` constraint `current_quota_lines` exists for — so without this, a
+/// save that re-rendered the right title and a save that re-rendered nothing
+/// at all would look identical from the outside.
+pub fn refresh_title<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let snapshot = current_snapshot(app)?;
+    let title = title_for(app, &snapshot, Utc::now());
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_title(Some(title.clone()));
+    }
+    Some(title)
+}
+
 /// Push a fresh snapshot into the tray: icon, title, and menu rows.
-pub fn apply(app: &AppHandle, snapshot: &UsageSnapshot) {
+///
+/// Generic over the Tauri runtime for the same reason `settings::load` is.
+/// Every production call site — the poller's three — passes a concrete
+/// `&AppHandle` (Wry) and is unchanged by it; `MockRuntime` has no tray, so
+/// everything below the lookup is skipped there, which is what lets the
+/// storing above it be driven from a test.
+pub fn apply<R: Runtime>(app: &AppHandle<R>, snapshot: &UsageSnapshot) {
+    // Recorded before the tray lookup, and before anything else can fail:
+    // this is the one point all three of the poller's render paths pass
+    // through — the cached replay at startup, a published poll, and the empty
+    // snapshot the signed-out path renders — so storing here is what keeps
+    // `refresh_title` rendering the numbers actually on screen rather than an
+    // older set. Having no tray to render into is not a reason to forget what
+    // the latest snapshot was, and putting it above the lookup is also what
+    // lets it be driven under `MockRuntime`, which has none.
+    if let Some(last) = app.try_state::<std::sync::Arc<LastSnapshot>>() {
+        last.set(snapshot.clone());
+    }
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let now = chrono::Utc::now();
+    let now = Utc::now();
 
     if let Ok(image) =
         tauri::image::Image::from_bytes(IconKind::for_quotas(&snapshot.quotas).bytes())
     {
         let _ = tray.set_icon(Some(image));
     }
-    let entries = crate::settings::load(app).title_entries;
-    let _ = tray.set_title(Some(render_title(&snapshot.quotas, &entries, now)));
+    let _ = tray.set_title(Some(title_for(app, snapshot, now)));
     let labels = menu_labels(&snapshot.quotas, now);
     if let Some(lines) = app.try_state::<std::sync::Arc<LastQuotaLines>>() {
         lines.set(labels.clone());
@@ -761,6 +844,45 @@ mod tests {
         assert_eq!(
             current_quota_lines(app.handle()),
             vec!["Label session — 20% · in 3h 58m".to_string()]
+        );
+    }
+
+    /// Every snapshot the poller renders has to land in `LastSnapshot`, not
+    /// just the successful poll: `apply` is the one point all three of its
+    /// render paths pass through — the cached replay at startup, a published
+    /// poll, and the empty snapshot the signed-out path renders — so the
+    /// numbers a later settings save re-renders are the numbers actually on
+    /// screen. The second half of this test is the one that matters: after
+    /// signing out, a save must not resurrect the quotas from before it.
+    ///
+    /// Runs against a `MockRuntime` app, which has no tray, so `apply`
+    /// returns at the lookup — the store therefore has to happen above it,
+    /// and this fails if it moves below.
+    #[test]
+    fn apply_stores_every_snapshot_it_renders_including_the_signed_out_one() {
+        let app = tauri::test::mock_builder()
+            .manage(std::sync::Arc::new(LastSnapshot::default()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+
+        let polled = UsageSnapshot {
+            quotas: vec![quota("session", 42.0, 200)],
+            fetched_at: now(),
+            stale: false,
+        };
+        apply(app.handle(), &polled);
+        assert_eq!(current_snapshot(app.handle()), Some(polled));
+
+        let signed_out = UsageSnapshot {
+            quotas: Vec::new(),
+            fetched_at: now(),
+            stale: false,
+        };
+        apply(app.handle(), &signed_out);
+        assert_eq!(
+            current_snapshot(app.handle()),
+            Some(signed_out),
+            "the signed-out render must replace the numbers, not leave them behind"
         );
     }
 
